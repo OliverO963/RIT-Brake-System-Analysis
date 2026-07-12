@@ -1,1 +1,2 @@
-# RIT-Brake-System-Analysis
+# RIT Brake System Analysis
+This repository collects all of the most important brakes and driver controls systems models for ease of use and version control. At the time of initial commit, it contains models and other code from over 15 years of RIT Racing's history, the original intent and development of which are unknown to the initial committer. Questions can be directed to Oliver Owen (oliver.owen.pers@gmail.com). 
