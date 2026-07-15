@@ -205,7 +205,7 @@ models(4).ub   = [ x2_bound,  quad_bound,  x3_bound,  b2_bound];
 models(4).x0   = [x2_seed, 0, 0, b2_seed];
 
 %% ================== RUN OPTIMIZATION FOR EACH MODEL ==================
-opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 1000, ...
+opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 3000, ...
     'FunctionTolerance', 1e-10, 'StepTolerance', 1e-10);
 
 results = struct('name', {}, 'params', {}, 'h_w', {}, 'padfrac_params', {}, ...
@@ -218,7 +218,7 @@ for m = 1:numel(models)
 
     x0 = [x1_seed, b1_seed, x1_seed, b1_seed, models(m).x0];
     lb = [x1_lb, b1_lb, x1_lb, b1_lb, models(m).lb];
-    ub = [x1_ub, b1_ub, x1_lb, b1_lb, models(m).ub];
+    ub = [x1_ub, b1_ub, x1_ub, b1_ub, models(m).ub];
 
     resFun = @(p) brake_temp_residuals(p, models(m).fun, datasets, ...
         VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
