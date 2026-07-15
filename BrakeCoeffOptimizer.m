@@ -205,7 +205,7 @@ models(4).ub   = [ x2_bound,  quad_bound,  x3_bound,  b2_bound];
 models(4).x0   = [x2_seed, 0, 0, b2_seed];
 
 %% ================== RUN OPTIMIZATION FOR EACH MODEL ==================
-opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 6000, ...
+opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 1000, ...
     'FunctionTolerance', 1e-10, 'StepTolerance', 1e-10);
 
 results = struct('name', {}, 'params', {}, 'h_w', {}, 'padfrac_params', {}, ...
@@ -216,9 +216,9 @@ TambK = TambC + 273.15;
 for m = 1:numel(models)
     fprintf('\n=== Fitting model %d/%d: %s ===\n', m, numel(models), models(m).name);
 
-    x0 = [x1_seed, b1_seed, models(m).x0];
-    lb = [x1_lb, b1_lb, models(m).lb];
-    ub = [x1_ub, b1_ub, models(m).ub];
+    x0 = [x1_seed, b1_seed, x1_seed, b1_seed, models(m).x0];
+    lb = [x1_lb, b1_lb, x1_lb, b1_lb, models(m).lb];
+    ub = [x1_ub, b1_ub, x1_lb, b1_lb, models(m).ub];
 
     resFun = @(p) brake_temp_residuals(p, models(m).fun, datasets, ...
         VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
@@ -237,16 +237,18 @@ for m = 1:numel(models)
 
     results(m).name           = models(m).name;
     results(m).params         = p_opt;
-    results(m).h_w            = p_opt(1:2);
-    results(m).padfrac_params = p_opt(3:end);
+    results(m).h_wF           = p_opt(1:2);
+    results(m).h_wR           = p_opt(3:4);
+    results(m).padfrac_params = p_opt(5:end);
     results(m).rmse_F         = rmse;
     results(m).sse            = sse;
     results(m).nresid         = nResid;
     results(m).nparams        = kParams;
     results(m).aicc           = aicc;
 
-    fprintf('  h_w:  x1 = %.4f, b1 = %.4f\n', p_opt(1), p_opt(2));
-    fprintf('  PadFrac params: %s\n', mat2str(p_opt(3:end), 5));
+    fprintf('  h_wF:  x1 = %.4f, b1 = %.4f\n', p_opt(1), p_opt(2));
+    fprintf('  h_wR:  x1 = %.4f, b1 = %.4f\n', p_opt(3), p_opt(4));
+    fprintf('  PadFrac params: %s\n', mat2str(p_opt(5:end), 5));
     fprintf('  RMSE = %.2f degF | AICc = %.1f\n', rmse, aicc);
 end
 
@@ -267,10 +269,10 @@ best_fun = models(best_idx).fun;
 for k = 1:nFiles
     ds = datasets(k);
     predF_front = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
-        best.h_w(1), best.h_w(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
+        best.h_wF(1), best.h_wF(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
         ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK);
     predF_rear = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
-        best.h_w(1), best.h_w(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
+        best.h_wR(1), best.h_wR(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
         ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK);
 
     figure('Name', sprintf('Best Fit - %s', ds.name));
@@ -289,8 +291,10 @@ end
 
 %% ================== FINAL COEFFICIENTS ==================
 fprintf('\n================ FINAL FIT (best model) ================\n');
-fprintf('x1 = %.6f;   %% h_w slope\n', best.h_w(1));
-fprintf('b1 = %.6f;   %% h_w intercept\n', best.h_w(2));
+fprintf('x1f = %.6f;   %% h_wF slope\n', best.h_wF(1));
+fprintf('b1f = %.6f;   %% h_wF intercept\n', best.h_wF(2));
+fprintf('x1r = %.6f;   %% h_wR slope\n', best.h_wR(1));
+fprintf('b1r = %.6f;   %% h_wR intercept\n', best.h_wR(2));
 fprintf('PadFrac params (%s):\n', models(best_idx).name);
 for i = 1:numel(best.padfrac_params)
     fprintf('  p(%d) = %.8g\n', i, best.padfrac_params(i));
@@ -456,18 +460,18 @@ function residual = brake_temp_residuals(p, padfrac_fun, datasets, ...
 % lsqnonlin. x1,b1 (h_w) and the PadFrac params are shared/global across
 % every dataset and both corners - only Tbias flips between front/rear.
 
-x1_p = p(1); b1_p = p(2); padfrac_params = p(3:end);
+x1f_p = p(1); b1f_p = p(2); x1r_p = p(3); b1r_p = p(4); padfrac_params = p(5:end);
 
 residual = [];
 for k = 1:numel(datasets)
     ds = datasets(k);
 
     predF_front = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
-        x1_p, b1_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
+        x1f_p, b1f_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
         ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK);
 
     predF_rear = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
-        x1_p, b1_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
+        x1r_p, b1r_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
         ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK);
 
     residual = [residual; predF_front(:) - ds.fr_temp_F(:); predF_rear(:) - ds.rr_temp_F(:)]; %#ok<AGROW>
