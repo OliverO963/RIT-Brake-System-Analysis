@@ -1,4 +1,3 @@
-
 %% F34 Brakes Data Analysis
 clc; clear; close all
 
