@@ -28,12 +28,16 @@ clear; clc; close all;
 %% ------------------------- USER INPUT -----------------------------
 tirFile = "G:\Shared drives\RIT Formula SAE\Knowledge Center\Vehicle Dynamics\In-House VD Tools\Car Goals Models\Tire Models\AgileTireR20_AdjustedFX.tir";  % path to your PAC2002/MF5.2 .tir file
 
+% VD-driven parameters
 geom.armLength           = 0.0853;   % [m]     steering arm length (kingpin to tie-rod ball joint)
-geom.rackRatio           = 0.14685;    % [m/rev] rack travel per ONE FULL revolution of the pinion
+geom.rackTravel          = 0.0407; % [m] steering rack travel (0 degrees to full lock in one direction)
+geom.maxTireRotationDeg  = (29.963 + 29.484)/2;      % [deg]   max tire steer angle from center, one direction (average of inner and outer to account for anti-Ackermann
+
+% BDC-driven parameters
+geom.maxWheelRotationDeg = 100;     % [deg]   max steering-wheel rotation from center, one direction
+geom.rackRatio           = geom.rackTravel/(geom.maxWheelRotationDeg/360);    % [m/rev] rack travel per ONE FULL revolution of the pinion
 geom.bevelGearRatio      = 1.0;    % [-]     column rotation / pinion rotation (1 = no bevel box)
 geom.wheelRadius         = 0.115;    % [m]     steering wheel rim radius
-geom.maxWheelRotationDeg = 110;     % [deg]   max steering-wheel rotation from center, one direction
-geom.maxTireRotationDeg  = 22;      % [deg]   max tire steer angle from center, one direction
 
 geom.Fz        = [];  % [N]   vertical load per tire; [] -> use tire's nominal load (LFZ0*FNOMIN)
 geom.camberDeg = -1.5;   % [deg] static camber angle
