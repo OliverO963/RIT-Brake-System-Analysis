@@ -18,12 +18,33 @@
 %      mechanism): T_wheel * dTheta_wheel = numTires * Mz * dDelta, i.e.
 %      T_wheel = numTires * Mz / ratio. Real friction losses would only
 %      increase effort above this, so treat results as a lower bound.
-%   Not included: Ackermann angle difference / load transfer between the
-%   two tires, overturning moment (Mx), scrub radius / kingpin offset.
+%   4. Tire normal load (Fz) is driven by the SAME static + longitudinal +
+%      lateral load-transfer formulas as the VD team's
+%      Steering_Torque_Full_Calc.m (front axle: Fz_Fs = m*g*w_F/2 -
+%      dFz_x/2, dFl = m*lat_g*g*h_cg*rd_F/track_F, Fz_OF/IF = Fz_Fs +/-
+%      dFl), evaluated at that script's same 5 load cases. We do NOT
+%      reproduce that script's combined-slip / torque-vectoring /
+%      iterative steer-angle solve -- this model has no vehicle-speed or
+%      cornering-equilibrium state (see point 1), so Fz is computed
+%      per-case and then held fixed across the tire-angle sweep, same as
+%      how a flat-trac Mz curve is measured at a fixed, specified load.
+%   Not included: Ackermann angle difference, overturning moment (Mx),
+%   scrub radius / kingpin offset, combined slip, torque vectoring.
+%
+% NEW IN THIS VERSION
+%   - Fz now comes from 5 load cases (matching Steering_Torque_Full_Calc.m)
+%     instead of a single nominal tire load.
+%   - Sensitivity sweeps for 3 Brakes & Driver Controls parameters: total
+%     wheel angular travel, intermediate column bevel-gear ratio, and
+%     steering-wheel rim radius. Each gets its own figure (family-of-curves
+%     vs wheel angle, plus peak torque/hand-force vs the swept parameter),
+%     evaluated at the single load case that produces the highest baseline
+%     peak torque (i.e. the worst case for driver effort).
 %
 % >>> EDIT THE "USER INPUT" SECTION BELOW <<<
 
 clear; clc; close all;
+set(0, 'DefaultFigureWindowStyle', 'docked');
 
 %% ------------------------- USER INPUT -----------------------------
 tirFile = "G:\Shared drives\RIT Formula SAE\Knowledge Center\Vehicle Dynamics\In-House VD Tools\Car Goals Models\Tire Models\AgileTireR20_AdjustedFX.tir";  % path to your PAC2002/MF5.2 .tir file
@@ -33,17 +54,58 @@ geom.armLength           = 0.0853;   % [m]     steering arm length (kingpin to t
 geom.rackTravel          = 0.0407; % [m] steering rack travel (0 degrees to full lock in one direction)
 geom.maxTireRotationDeg  = (29.963 + 29.484)/2;      % [deg]   max tire steer angle from center, one direction (average of inner and outer to account for anti-Ackermann
 
-% BDC-driven parameters
+% BDC-driven parameters (BASELINE values -- these are also the sweep
+% baselines below: each sensitivity sweep varies ONE of these three while
+% holding the other two at these baseline values)
 geom.maxWheelRotationDeg = 100;     % [deg]   max steering-wheel rotation from center, one direction
-geom.rackRatio           = geom.rackTravel/(geom.maxWheelRotationDeg/360);    % [m/rev] rack travel per ONE FULL revolution of the pinion
 geom.bevelGearRatio      = 1.0;    % [-]     column rotation / pinion rotation (1 = no bevel box)
 geom.wheelRadius         = 0.115;    % [m]     steering wheel rim radius
+geom.rackRatio           = geom.rackTravel/(geom.maxWheelRotationDeg/360);    % [m/rev] rack travel per ONE FULL revolution of the pinion
 
-geom.Fz        = [];  % [N]   vertical load per tire; [] -> use tire's nominal load (LFZ0*FNOMIN)
+geom.Fz        = [];  % [N]   fallback only (LFZ0*FNOMIN); overwritten per load case below
 geom.camberDeg = -1.5;   % [deg] static camber angle
 geom.numTires  = 2;   % number of steered tires reacting torque through this shaft
 
 nPoints = 200;        % resolution of the sweep from 0 to maxTireRotationDeg
+
+% ---- Vehicle / normal-load (Fz) parameters -----------------------------
+% Same values & formulas as Steering_Torque_Full_Calc.m's front-axle
+% load-transfer block (m_total, w_front, h_cg_mm, wheelbase_mm, track_F_mm,
+% K_roll_F/R_NmDeg). Only the load-transfer piece is reused -- not the
+% combined-slip tire solve, TV algorithm, or iterative steer-angle solve.
+vehicle.m_total     = 186 + 68;      % [kg]
+vehicle.w_front     = 0.505;         % [-]  front weight distribution
+vehicle.h_cg        = 271.5/1000;    % [m]
+vehicle.wheelbase   = 1574.8/1000;   % [m]
+vehicle.track_F     = 1219.2/1000;   % [m]
+K_roll_F_NmDeg      = 971.1;         % [Nm/deg]
+K_roll_R_NmDeg      = 971.1;         % [Nm/deg]
+vehicle.roll_dist_F = K_roll_F_NmDeg/(K_roll_F_NmDeg + K_roll_R_NmDeg);
+
+% How to collapse the outer/inner front tire loads into the single Fz this
+% model applies to BOTH steered tires (this model, unlike the VD team's,
+% does not solve outer/inner tires separately):
+%   'average' -> Fz = mean(Fz_OF,Fz_IF). NOTE: lateral transfer cancels
+%                EXACTLY in this mean (Fz_avg = Fz_Fs regardless of
+%                lat_g), so cases sharing the same long_g collapse to the
+%                same Fz. Longitudinal transfer still comes through.
+%   'outer'   -> Fz = Fz_OF (the more heavily loaded, torque-dominant
+%                tire). Captures the lateral component too, at the cost
+%                of the "single averaged Fz" simplicity.
+fzRepresentativeMode = 'average';
+
+% Same 5 load cases as Steering_Torque_Full_Calc.m (name, lat_g, long_g)
+loadCases = { ...
+  'Skidpad steady',      1.00,  0.00; ...
+  'Hairpin exit',        0.80,  0.80; ...
+  'Hairpin exit hard',   0.60,  1.10; ...
+  'Entry on regen',      0.80, -1.00; ...
+  'Sweeper + regen',     1.00, -0.60};
+
+% ---- Brakes & Driver Controls sensitivity sweeps -----------------------
+wheelRotationSweepDeg  = linspace(90, 110, 5);   % [deg] total wheel travel from center, one direction
+bevelGearRatioSweep    = linspace(0.8, 1.2, 5);  % [-]   +/-20% around baseline column/pinion ratio
+wheelRadiusSweep_mm    = linspace(100, 130, 5);  % [mm]  steering wheel rim radius
 %% ---------------------------------------------------------------------
 
 P = readTIR(tirFile);
@@ -52,49 +114,209 @@ if isempty(geom.Fz)
 end
 
 tireAngleSweepDeg = linspace(0.05, geom.maxTireRotationDeg, nPoints);
-result = steeringShaftTorque(tireAngleSweepDeg, P, geom);
 
+%% ----------------- Geometry consistency check (Fz-independent) --------
+checkResult = steeringShaftTorque(tireAngleSweepDeg, P, geom);
 fprintf('--- Geometry consistency check ---\n');
 fprintf('At max tire angle (%.1f deg), this geometry gives a wheel angle of %.1f deg ', ...
-        geom.maxTireRotationDeg, result.check.predictedWheelAngleAtMaxTire_deg);
+        geom.maxTireRotationDeg, checkResult.check.predictedWheelAngleAtMaxTire_deg);
 fprintf('(you specified %.1f deg, %.1f%% difference).\n', ...
-        result.check.specifiedMaxWheelRotationDeg, result.check.percentDifference);
+        checkResult.check.specifiedMaxWheelRotationDeg, checkResult.check.percentDifference);
 fprintf('If this is off, adjust armLength / rackRatio / bevelGearRatio.\n\n');
 
-[peakTorque, idxPeak] = max(result.steeringTorque_Nm);
-fprintf('Peak steering-shaft torque: %.2f N*m at tire angle %.1f deg (wheel angle %.1f deg), ', ...
-        peakTorque, result.tireAngleDeg(idxPeak), result.steeringWheelAngleDeg(idxPeak));
-fprintf('hand force %.1f N.\n\n', result.handForce_N(idxPeak));
+%% ----------------- Front-axle Fz per load case -------------------------
+nCases = size(loadCases, 1);
+caseFz = zeros(nCases, 3); % columns: Fz_OF, Fz_IF, Fz_avg
+fprintf('--- Front-axle Fz by load case (load-transfer only, no TV/combined-slip) ---\n');
+fprintf('%-19s %6s %6s %8s %8s %8s\n', 'case', 'lat_g', 'long_g', 'Fz_OF', 'Fz_IF', 'Fz_used');
+for ii = 1:nCases
+    [Fz_OF, Fz_IF, Fz_avg] = frontAxleFz(loadCases{ii,2}, loadCases{ii,3}, vehicle);
+    caseFz(ii,:) = [Fz_OF, Fz_IF, Fz_avg];
+    Fz_used = pickFz(caseFz(ii,:), fzRepresentativeMode);
+    fprintf('%-19s %6.2f %6.2f %8.0f %8.0f %8.0f\n', ...
+        loadCases{ii,1}, loadCases{ii,2}, loadCases{ii,3}, Fz_OF, Fz_IF, Fz_used);
+end
+if strcmp(fzRepresentativeMode, 'average')
+    fprintf(['NOTE: fzRepresentativeMode = ''average'' -- lateral load transfer cancels\n' ...
+             'in this mean, so cases with the same long_g show the same Fz_used above.\n' ...
+             'Set fzRepresentativeMode = ''outer'' to keep the lateral component.\n']);
+end
+fprintf('\n');
 
-%% ------------------------------- Plots --------------------------------
-figure('Name', 'Steering Effort', 'Color', 'w', 'Position', [100 100 1000 700]);
+%% ----------------- Baseline sweep, one curve per load case -------------
+resultsByCase = cell(nCases, 1);
+fprintf('--- Peak steering-shaft torque by load case (baseline BDC geometry) ---\n');
+for ii = 1:nCases
+    geomCase = geom;
+    geomCase.Fz = pickFz(caseFz(ii,:), fzRepresentativeMode);
+    resultsByCase{ii} = steeringShaftTorque(tireAngleSweepDeg, P, geomCase);
+    [pk, idxPk] = max(resultsByCase{ii}.steeringTorque_Nm);
+    fprintf('%-19s peak %6.2f N*m at tire angle %5.1f deg (wheel %5.1f deg), hand force %6.1f N\n', ...
+        loadCases{ii,1}, pk, resultsByCase{ii}.tireAngleDeg(idxPk), ...
+        resultsByCase{ii}.steeringWheelAngleDeg(idxPk), resultsByCase{ii}.handForce_N(idxPk));
+end
+fprintf('\n');
 
-subplot(2,2,1);
-plot(result.tireAngleDeg, result.MzPerTire_Nm, 'LineWidth', 1.5); grid on;
+peakTorqueByCase = cellfun(@(r) max(r.steeringTorque_Nm), resultsByCase);
+[worstPeakTorque, worstCaseIdx] = max(peakTorqueByCase);
+worstCaseFz = pickFz(caseFz(worstCaseIdx,:), fzRepresentativeMode);
+fprintf('Using "%s" (Fz = %.0f N) for the BDC sensitivity sweeps below -- it produces\n', ...
+    loadCases{worstCaseIdx,1}, worstCaseFz);
+fprintf('the highest baseline peak torque (%.2f N*m) of the 5 load cases.\n\n', worstPeakTorque);
+
+%% ------------------------------- Plots (baseline, by load case) -------
+caseLegend = loadCases(:,1);
+co = lines(nCases);
+
+figure('Name', 'Steering Effort by Load Case', 'Color', 'w', 'Position', [50 50 1000 700]);
+
+subplot(2,2,1); hold on; grid on;
+for ii = 1:nCases
+    plot(resultsByCase{ii}.tireAngleDeg, resultsByCase{ii}.MzPerTire_Nm, 'Color', co(ii,:), 'LineWidth', 1.5);
+end
 xlabel('Tire steer angle [deg]'); ylabel('|M_z| per tire [N\cdotm]');
-title('Tire self-aligning moment (Pacejka Mz_0)');
+title('Tire self-aligning moment (Pacejka Mz_0)'); legend(caseLegend, 'Location', 'best');
 
-subplot(2,2,2);
-plot(result.tireAngleDeg, result.steeringWheelAngleDeg, 'LineWidth', 1.5); grid on;
+subplot(2,2,2); hold on; grid on;
+for ii = 1:nCases
+    plot(resultsByCase{ii}.tireAngleDeg, resultsByCase{ii}.steeringWheelAngleDeg, 'Color', co(ii,:), 'LineWidth', 1.5);
+end
 xlabel('Tire steer angle [deg]'); ylabel('Steering wheel angle [deg]');
-title('Steering system kinematics');
+title('Steering system kinematics (Fz-independent -- lines overlap)'); legend(caseLegend, 'Location', 'best');
 
-subplot(2,2,3);
-plot(result.steeringWheelAngleDeg, result.steeringTorque_Nm, 'LineWidth', 1.5); grid on;
+subplot(2,2,3); hold on; grid on;
+for ii = 1:nCases
+    plot(resultsByCase{ii}.steeringWheelAngleDeg, resultsByCase{ii}.steeringTorque_Nm, 'Color', co(ii,:), 'LineWidth', 1.5);
+end
 xlabel('Steering wheel angle [deg]'); ylabel('Steering shaft torque [N\cdotm]');
-title('Torque driver must react, vs. wheel angle');
+title('Torque driver must react, vs. wheel angle'); legend(caseLegend, 'Location', 'best');
 
-subplot(2,2,4);
-plot(result.steeringWheelAngleDeg, result.handForce_N, 'LineWidth', 1.5); grid on;
+subplot(2,2,4); hold on; grid on;
+for ii = 1:nCases
+    plot(resultsByCase{ii}.steeringWheelAngleDeg, resultsByCase{ii}.handForce_N, 'Color', co(ii,:), 'LineWidth', 1.5);
+end
 xlabel('Steering wheel angle [deg]'); ylabel('Equivalent rim hand force [N]');
-title(sprintf('Hand force (rim radius = %.0f mm)', geom.wheelRadius*1000));
+title(sprintf('Hand force (rim radius = %.0f mm)', geom.wheelRadius*1000)); legend(caseLegend, 'Location', 'best');
 
-sgtitle('Steering Effort Model');
+sgtitle('Steering Effort by Load Case (baseline BDC geometry)');
+
+%% ------------------- BDC sensitivity sweeps ----------------------------
+sweepGeomBase = geom;
+sweepGeomBase.Fz = worstCaseFz;
+
+applyWheelRotation = @(g, v) setWheelRotation(g, v);
+applyBevelRatio     = @(g, v) setBevelRatio(g, v);
+applyWheelRadius    = @(g, v) setWheelRadius(g, v);
+
+[wrResults, wrPeakT, wrPeakF] = runParamSweep(wheelRotationSweepDeg, applyWheelRotation, sweepGeomBase, P, tireAngleSweepDeg);
+[bgResults, bgPeakT, bgPeakF] = runParamSweep(bevelGearRatioSweep, applyBevelRatio, sweepGeomBase, P, tireAngleSweepDeg);
+[wrdResults, wrdPeakT, wrdPeakF] = runParamSweep(wheelRadiusSweep_mm, applyWheelRadius, sweepGeomBase, P, tireAngleSweepDeg);
+
+plotSensitivity('Sensitivity to Total Wheel Angular Travel', wheelRotationSweepDeg, ...
+    'Max wheel rotation, one direction [deg]', wrResults, wrPeakT, wrPeakF);
+
+plotSensitivity('Sensitivity to Intermediate Column Bevel Gear Ratio', bevelGearRatioSweep, ...
+    'Bevel gear ratio [-]', bgResults, bgPeakT, bgPeakF);
+
+plotSensitivity('Sensitivity to Steering Wheel Radius', wheelRadiusSweep_mm, ...
+    'Wheel rim radius [mm]', wrdResults, wrdPeakT, wrdPeakF);
 
 
 %% ======================================================================
 %  LOCAL FUNCTIONS (script-local functions, MATLAB R2016b+)
 %  ======================================================================
+
+function [Fz_OF, Fz_IF, Fz_avg] = frontAxleFz(lat_g, long_g, vehicle)
+%FRONTAXLEFZ Front-axle outer/inner tire normal load from static +
+%   longitudinal + lateral load transfer. Same formulas as the front-axle
+%   block of Steering_Torque_Full_Calc.m's solve_corner (load transfer
+%   only -- no combined-slip / TV / steer-angle iteration).
+    g = 9.81;
+    dFz_x = vehicle.m_total * long_g * g * vehicle.h_cg / vehicle.wheelbase;
+    Fz_Fs = vehicle.m_total * g * vehicle.w_front/2 - dFz_x/2;
+    dFl   = vehicle.m_total * lat_g * g * vehicle.h_cg * vehicle.roll_dist_F / vehicle.track_F;
+    Fz_OF = max(Fz_Fs + dFl, 0);
+    Fz_IF = max(Fz_Fs - dFl, 0);
+    Fz_avg = (Fz_OF + Fz_IF) / 2;
+end
+
+function Fz = pickFz(caseFzRow, mode)
+%PICKFZ Collapse [Fz_OF Fz_IF Fz_avg] to a single Fz per fzRepresentativeMode.
+    switch mode
+        case 'average', Fz = caseFzRow(3);
+        case 'outer',   Fz = caseFzRow(1);
+        otherwise, error('pickFz:badMode', 'fzRepresentativeMode must be ''average'' or ''outer''.');
+    end
+end
+
+function g = setWheelRotation(g, maxWheelRotationDeg)
+%SETWHEELROTATION Update total wheel travel and its dependent rack ratio.
+    g.maxWheelRotationDeg = maxWheelRotationDeg;
+    g.rackRatio = g.rackTravel / (maxWheelRotationDeg/360);
+end
+
+function g = setBevelRatio(g, bevelGearRatio)
+    g.bevelGearRatio = bevelGearRatio;
+end
+
+function g = setWheelRadius(g, wheelRadius_mm)
+    g.wheelRadius = wheelRadius_mm / 1000;
+end
+
+function [sweepResults, peakTorque_Nm, peakHandForce_N] = runParamSweep(paramValues, applyFcn, baseGeom, P, tireAngleSweepDeg)
+%RUNPARAMSWEEP Run steeringShaftTorque once per value in PARAMVALUES,
+%   modifying baseGeom via APPLYFCN(geom, value) each time.
+    n = numel(paramValues);
+    sweepResults = cell(n, 1);
+    peakTorque_Nm = zeros(n, 1);
+    peakHandForce_N = zeros(n, 1);
+    for k = 1:n
+        g = applyFcn(baseGeom, paramValues(k));
+        r = steeringShaftTorque(tireAngleSweepDeg, P, g);
+        sweepResults{k} = r;
+        peakTorque_Nm(k) = max(r.steeringTorque_Nm);
+        peakHandForce_N(k) = max(r.handForce_N);
+    end
+end
+
+function plotSensitivity(figTitle, paramValues, paramLabel, sweepResults, peakTorque_Nm, peakHandForce_N)
+%PLOTSENSITIVITY One figure per BDC parameter: family-of-curves (torque
+%   and hand force vs wheel angle, one line per swept value) plus
+%   peak-torque / peak-hand-force vs the swept parameter.
+    n = numel(paramValues);
+    co = lines(n);
+    legendLabels = arrayfun(@(v) sprintf('%.3g', v), paramValues, 'UniformOutput', false);
+
+    figure('Name', figTitle, 'Color', 'w', 'Position', [100 100 1000 700]);
+
+    subplot(2,2,1); hold on; grid on;
+    for k = 1:n
+        plot(sweepResults{k}.steeringWheelAngleDeg, sweepResults{k}.steeringTorque_Nm, ...
+            'Color', co(k,:), 'LineWidth', 1.5);
+    end
+    xlabel('Steering wheel angle [deg]'); ylabel('Steering shaft torque [N\cdotm]');
+    title('Torque vs. wheel angle'); legend(legendLabels, 'Location', 'best');
+
+    subplot(2,2,2); hold on; grid on;
+    for k = 1:n
+        plot(sweepResults{k}.steeringWheelAngleDeg, sweepResults{k}.handForce_N, ...
+            'Color', co(k,:), 'LineWidth', 1.5);
+    end
+    xlabel('Steering wheel angle [deg]'); ylabel('Hand force [N]');
+    title('Hand force vs. wheel angle'); legend(legendLabels, 'Location', 'best');
+
+    subplot(2,2,3);
+    plot(paramValues, peakTorque_Nm, '-o', 'LineWidth', 1.5); grid on;
+    xlabel(paramLabel); ylabel('Peak steering torque [N\cdotm]');
+    title('Peak torque sensitivity');
+
+    subplot(2,2,4);
+    plot(paramValues, peakHandForce_N, '-o', 'LineWidth', 1.5); grid on;
+    xlabel(paramLabel); ylabel('Peak hand force [N]');
+    title('Peak hand force sensitivity');
+
+    sgtitle(figTitle);
+end
 
 function out = steeringShaftTorque(tireAngleDeg, tirInput, geom)
 %STEERINGSHAFTTORQUE Steering-shaft torque to hold/achieve a tire angle.
