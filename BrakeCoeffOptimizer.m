@@ -17,6 +17,7 @@
 % ================================================================
 
 clc; clear; close all
+cfg.SkipTimeCropPrompt = true;
 
 %% ================== USER INPUTS ==================
 % Vehicle / rotor parameters (same as BrakeDataAnalysis.m - adjust as needed)
@@ -97,15 +98,22 @@ for k = 1:nFiles
 
     % Per-dataset time crop
     t_full = raw(:, 1);
-    prompt = {sprintf('Start time (s)  [data range %.1f - %.1f]:', t_full(1), t_full(end)), 'End time (s):'};
-    defaultAns = {num2str(t_full(1)), num2str(t_full(end))};
-    answer = inputdlg(prompt, sprintf('Time crop: %s', files{k}), 1, defaultAns);
-    if isempty(answer)
-        t_start_k = t_full(1); t_end_k = t_full(end);
+    
+    if cfg.SkipTimeCropPrompt
+        t_start_k = t_full(1);
+        t_end_k   = t_full(end);
     else
-        t_start_k = str2double(answer{1});
-        t_end_k   = str2double(answer{2});
+        prompt = {sprintf('Start time (s)  [data range %.1f - %.1f]:', t_full(1), t_full(end)), 'End time (s):'};
+        defaultAns = {num2str(t_full(1)), num2str(t_full(end))};
+        answer = inputdlg(prompt, sprintf('Time crop: %s', files{k}), 1, defaultAns);
+        if isempty(answer)
+            t_start_k = t_full(1); t_end_k = t_full(end);
+        else
+            t_start_k = str2double(answer{1});
+            t_end_k   = str2double(answer{2});
+        end
     end
+
     raw = raw(t_full >= t_start_k & t_full <= t_end_k, :);
     if size(raw, 1) < 3
         warning('  Dataset %s has < 3 samples after crop - skipping.', files{k});
@@ -304,6 +312,78 @@ fprintf('the plain linear-in-T baseline), you must update the PadFrac formula\n'
 fprintf('inside run_sim (in brake_temp_sim.m) to match models(%d).fun above -\n', best_idx);
 fprintf('the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the\n');
 fprintf('new pressure-dependent terms.\n');
+
+%% ================== AGGREGATED PLOTS (Rotor temp in °F, axes start at 0) ==================
+% Creates two figures total combining all parsed datasets.
+% Assumes variables: datasets, best, best_fun, results, best_idx exist.
+
+% -- prepare global ranges --
+all_vel = vertcat(datasets.velx);
+vmin = 0; vmax = max(all_vel);
+vvec = linspace(vmin, vmax, 400);
+
+all_TF_pts = vertcat(datasets.fr_temp_F, datasets.rr_temp_F); % measured rotor temps in °F
+Tmin_F = min(all_TF_pts); Tmax_F = max(all_TF_pts);
+
+all_P = vertcat(datasets.frontpressure, datasets.rearpressure);
+Pmin = 0; Pmax = max(all_P);
+
+% --- FIGURE 1: h_w vs vehicle velocity (all datasets combined) ---
+figure('Name','h\_w vs Velocity - All Datasets');
+hold on;
+for k = 1:numel(datasets)
+    % use same representative linear model for each dataset (over global vvec)
+    hF = best.h_wF(1) .* vvec + best.h_wF(2);
+    hR = best.h_wR(1) .* vvec + best.h_wR(2);
+    plot(vvec, hF, 'r-', 'LineWidth', 1, 'HandleVisibility','off');
+    plot(vvec, hR, 'b--', 'LineWidth', 1, 'HandleVisibility','off');
+end
+plot(vvec, best.h_wF(1).*vvec + best.h_wF(2), 'r-', 'LineWidth', 2, 'DisplayName','Front h\_w (all)');
+plot(vvec, best.h_wR(1).*vvec + best.h_wR(2), 'b--', 'LineWidth', 2, 'DisplayName','Rear h\_w (all)');
+xlabel('Vehicle Velocity (m/s)');
+ylabel('h\_w (W/m^2K)');
+xlim([0, vmax]);
+legend('Location','best');
+grid on;
+title('Convective Coefficient h\_w vs Velocity (All Datasets)');
+
+% --- FIGURE 2: PadFrac(T_{°F}, P) 3D surface with T in °F and axes starting at 0 ---
+% Create TF and P grids (TF in °F), convert to K for model evaluation
+Tvec_F = linspace(max(0, Tmin_F - 5), Tmax_F + 5, 160);
+Pvec   = linspace(Pmin, Pmax + 2, 120);
+[TFF, PP] = meshgrid(Tvec_F, Pvec);
+
+% convert TF grid to K for model
+TK_grid = (TFF - 32) * (5/9) + 273.15;
+PF_raw = best_fun(TK_grid, PP, best.padfrac_params);
+PF = min(max(PF_raw, 0), 1);
+
+figure('Name','PadFrac vs Temperature(°F) and Pressure - All Datasets');
+surf(TFF, PP, PF, 'EdgeColor','none', 'FaceAlpha', 0.9);
+hold on;
+% overlay measured sample points (TF, P)
+all_TF_pts = []; all_P_pts = [];
+for k = 1:numel(datasets)
+    ds = datasets(k);
+    TF_fr = ds.fr_temp_F(:);
+    TF_rr = ds.rr_temp_F(:);
+    all_TF_pts = [all_TF_pts; TF_fr; TF_rr]; %#ok<AGROW>
+    all_P_pts  = [all_P_pts; ds.frontpressure(:); ds.rearpressure(:)]; %#ok<AGROW>
+end
+TK_pts = (all_TF_pts - 32) * (5/9) + 273.15;
+PF_pts_raw = best_fun(TK_pts, all_P_pts, best.padfrac_params);
+PF_pts = min(max(PF_pts_raw, 0), 1);
+scatter3(all_TF_pts, all_P_pts, PF_pts, 18, PF_pts, 'filled', 'MarkerEdgeColor','k', 'MarkerFaceAlpha',0.85);
+
+colorbar;
+xlabel('Rotor Temp (°F)');
+ylabel('Applied Pressure (psi)');
+zlabel('PadFrac (clamped)');
+xlim([0, max(Tvec_F)]);
+ylim([0, max(Pvec)]);
+title(sprintf('PadFrac(T_{°F},P) — All Datasets (model: %s)', results(best_idx).name), 'Interpreter', 'none');
+view(45,25);
+grid on;
 
 
 %% ================================================================
