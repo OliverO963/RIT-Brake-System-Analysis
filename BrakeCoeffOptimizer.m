@@ -29,7 +29,7 @@ RotorArea_rear  = 0.0226;   % m^2
 I               = 0.30754;  % rotational inertia kg*m^2
 WheelR          = 0.213;    % meters
 gear_ratio      = 12.97;    % motor to wheel gear ratio
-TambC           = 25;       % degC
+TambC           = 25;       % degC - fallback only; each dataset now derives its own ambient (see loading loop)
 
 % Brake geometry (needed to reconstruct Tbias_brake from raw pressures)
 front_piston_count = 6;
@@ -77,7 +77,7 @@ gearParams = struct('gear_ratio', gear_ratio, 'velx_threshold', velx_threshold);
 datasets = struct('name', {}, 't', {}, 'velx', {}, 'frontpressure', {}, 'rearpressure', {}, ...
     'fr_temp_F', {}, 'rr_temp_F', {}, 'Tbias_brake', {}, 'F_aero', {}, 'Edrag', {}, ...
     'total_regen_power', {}, 'fl_omega_wheel', {}, 'fr_omega_wheel', {}, ...
-    'rl_omega_wheel', {}, 'rr_omega_wheel', {});
+    'rl_omega_wheel', {}, 'rr_omega_wheel', {}, 'TambK', {});
 
 for k = 1:nFiles
     fname = fullfile(path, files{k});
@@ -124,6 +124,26 @@ for k = 1:nFiles
     derived = compute_derived_quantities(parsed, gearParams, aeroParams);
     Edrag   = compute_edrag(parsed.t, derived.velx, derived.F_aero);
 
+    % Per-dataset ambient temperature: average of this dataset's first
+    % front and rear rotor-temperature readings (degF -> degC -> K).
+    % Falls back to the global TambC if a first reading is missing.
+    firstFrontF = derived.fr_temp_F(1);
+    firstRearF  = derived.rr_temp_F(1);
+    if isfinite(firstFrontF) && isfinite(firstRearF)
+        TambC_dataset = ((firstFrontF + firstRearF) / 2 - 32) * (5/9);
+    elseif isfinite(firstFrontF)
+        TambC_dataset = (firstFrontF - 32) * (5/9);
+        warning('  Dataset %s: first rear temperature reading missing - ambient taken from front only.', files{k});
+    elseif isfinite(firstRearF)
+        TambC_dataset = (firstRearF - 32) * (5/9);
+        warning('  Dataset %s: first front temperature reading missing - ambient taken from rear only.', files{k});
+    else
+        TambC_dataset = TambC;
+        warning('  Dataset %s: first front/rear temperature readings both missing - falling back to global TambC = %.1f C.', files{k}, TambC);
+    end
+    TambK_dataset = TambC_dataset + 273.15;
+    fprintf('  Dataset ambient temperature: %.1f C (%.1f F)\n', TambC_dataset, TambC_dataset*9/5+32);
+
     idx = numel(datasets) + 1;
     datasets(idx).name              = files{k};
     datasets(idx).t                 = parsed.t;
@@ -140,6 +160,7 @@ for k = 1:nFiles
     datasets(idx).fr_omega_wheel    = derived.fr_omega_wheel;
     datasets(idx).rl_omega_wheel    = derived.rl_omega_wheel;
     datasets(idx).rr_omega_wheel    = derived.rr_omega_wheel;
+    datasets(idx).TambK             = TambK_dataset;
 
     fprintf('  %d samples, %.1f s duration\n', numel(parsed.t), parsed.t(end) - parsed.t(1));
 end
@@ -219,8 +240,6 @@ opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 30
 results = struct('name', {}, 'params', {}, 'h_w', {}, 'padfrac_params', {}, ...
     'rmse_F', {}, 'avg_pct_err', {}, 'sse', {}, 'nresid', {}, 'nparams', {}, 'aicc', {});
 
-TambK = TambC + 273.15;
-
 for m = 1:numel(models)
     fprintf('\n=== Fitting model %d/%d: %s ===\n', m, numel(models), models(m).name);
 
@@ -230,7 +249,7 @@ for m = 1:numel(models)
 
     resFun = @(p) brake_temp_residuals(p, models(m).fun, datasets, ...
         VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-        I, WheelR, TambK);
+        I, WheelR);
 
     [p_opt, resnorm, residual] = lsqnonlin(resFun, x0, lb, ub, opts);
 
@@ -278,10 +297,10 @@ for k = 1:nFiles
     ds = datasets(k);
     predF_front = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
         best.h_wF(1), best.h_wF(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK);
+        ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, ds.TambK);
     predF_rear = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
         best.h_wR(1), best.h_wR(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK);
+        ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, ds.TambK);
 
     figure('Name', sprintf('Best Fit - %s', ds.name));
     subplot(2,1,1);
@@ -535,7 +554,7 @@ end
 
 function residual = brake_temp_residuals(p, padfrac_fun, datasets, ...
     VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-    I, WheelR, TambK)
+    I, WheelR)
 % Pools front + rear residuals across ALL datasets into one vector for
 % lsqnonlin. x1,b1 (h_w) and the PadFrac params are shared/global across
 % every dataset and both corners - only Tbias flips between front/rear.
@@ -548,11 +567,11 @@ for k = 1:numel(datasets)
 
     predF_front = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
         x1f_p, b1f_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK);
+        ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, ds.TambK);
 
     predF_rear = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
         x1r_p, b1r_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK);
+        ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, ds.TambK);
 
     residual = [residual; predF_front(:) - ds.fr_temp_F(:); predF_rear(:) - ds.rr_temp_F(:)]; %#ok<AGROW>
 end
