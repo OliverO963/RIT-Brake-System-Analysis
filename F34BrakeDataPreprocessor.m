@@ -163,6 +163,7 @@ end
 
 sessionKeys = unique(string({sources.sessionKey}), 'stable');
 manifestRows = struct([]);
+plottedCount = 0;
 
 for g = 1:numel(sessionKeys)
     key = sessionKeys(g);
@@ -171,6 +172,12 @@ for g = 1:numel(sessionKeys)
 
     session = mergeSessionSources(groupSources, cfg);
     session.kind = classifySession(session, cfg);
+
+    % Snapshot the session exactly as merged, before any validity
+    % clamping, spike filtering, or startup trimming, so it can be
+    % plotted against the final processed/exported data later.
+    rawSnapshot = struct('time', session.time, 'channels', session.channels);
+
     [session, readiness] = prepareOptimizerChannels(session, cfg);
 
     if cfg.RawFormatOnly
@@ -212,6 +219,11 @@ for g = 1:numel(sessionKeys)
         writeOptimizerTextFile(outputPath, outMatrix, outHeaders, metadata);
         fprintf('  Wrote %s (%d rows, %d columns) - no trimming or filtering applied.\n', ...
             fileName, size(outMatrix,1), size(outMatrix,2));
+
+        if cfg.PlotRawVsProcessed && plottedCount < cfg.PlotRawVsProcessedMaxCount
+            plotRawVsProcessed(rawSnapshot, session, wholeSegment, key, 0);
+            plottedCount = plottedCount + 1;
+        end
     
         exportStatus = "exported_raw_format";
         if ~readiness.ready
@@ -288,6 +300,11 @@ for g = 1:numel(sessionKeys)
     if ~readiness.ready
         fprintf('  Exporting incomplete data. Missing channels will be NaN: %s\n', ...
             strjoin(readiness.missing, ', '));
+    end
+
+    if cfg.PlotRawVsProcessed && plottedCount < cfg.PlotRawVsProcessedMaxCount
+        plotRawVsProcessed(rawSnapshot, session, segments, key, startupInfo.trimmedDuration_s);
+        plottedCount = plottedCount + 1;
     end
 
     safeKey = sanitizeFileName(key);
@@ -378,13 +395,13 @@ cfg.OutputFolderName = "BrakeCoeffOptimizer_Ready";
 
 % Export all retained driving portions from each session into one file.
 % Set this false to return to one file per detected segment.
-cfg.CombineSegmentsIntoOneFile = true;
+cfg.CombineSegmentsIntoOneFile = false;
 
 % When true, skip temperature-startup cleaning, spike filtering, and
 % segment detection entirely - just reformat each session's full time
 % range into the optimizer's column layout and write it out as-is.
 % Useful when the input has already been trimmed/curated upstream.
-cfg.RawFormatOnly = true;
+cfg.RawFormatOnly = false;
 
 % F34 vehicle values used only when motor RPM must be estimated from speed.
 cfg.GearRatio = 12.97;
@@ -525,6 +542,14 @@ cfg.TemperatureStartup.SpikeFilter.MadFactor = 6.0;
 % The supplied optimizer uses motor torque to calculate regen energy. Keeping
 % this false prevents the script from silently assuming zero regen.
 cfg.AllowZeroMotorTorqueFallback = false;
+
+% Diagnostic plot: overlay RAW (as read from the source file, before any
+% cleaning) against PROCESSED (after spike filtering / startup trim,
+% restricted to what was actually written to the output file) so
+% cleaning behavior can be sanity-checked visually. Plots are generated
+% in processing order, up to PlotRawVsProcessedMaxCount sessions.
+cfg.PlotRawVsProcessed = true;
+cfg.PlotRawVsProcessedMaxCount = 3;
 end
 
 %% File discovery and import
@@ -2268,4 +2293,73 @@ if isempty(rows)
 else
     manifest = struct2table(rows);
 end
+end
+
+%% Diagnostic: raw vs. processed comparison
+function plotRawVsProcessed(rawSnapshot, session, segments, key, trimOffset_s)
+% Overlays RAW (as read from the source file, before any cleaning)
+% against PROCESSED (after spike filtering / startup trim, restricted to
+% the time ranges actually written to the output file) for one session,
+% so the effect of every cleaning step above can be sanity-checked by
+% eye. Both curves are drawn on the source file's original absolute
+% time axis: the processed time base (which may have been reset to 0 by
+% cleanTemperatureStartup) is shifted back by trimOffset_s so the two
+% line up.
+
+rawT = double(rawSnapshot.time(:));
+if isempty(rawT)
+    return;
+end
+procT = double(session.time(:)) + rawT(1) + trimOffset_s;
+
+% Only draw the processed curve where a sample actually ended up inside
+% an exported segment - this is "processed" in the sense of "what is in
+% the output file", not just "what cleanTemperatureStartup computed".
+keepMask = false(size(procT));
+for s = 1:numel(segments)
+    idx = segments(s).startIndex:segments(s).endIndex;
+    idx = idx(idx >= 1 & idx <= numel(keepMask));
+    keepMask(idx) = true;
+end
+
+figure('Name', sprintf('Raw vs Processed - %s', key));
+
+panels = { ...
+    "tempFRRaw",        "Front Rotor Temp (deg F)",   @adcToF; ...
+    "tempRRRaw",         "Rear Rotor Temp (deg F)",    @adcToF; ...
+    "speed",             "Speed (m/s)",                @(x) x; ...
+    "frontPressureRaw",  "Front Brake Pressure (ADC)", @(x) x};
+
+for p = 1:size(panels,1)
+    field   = panels{p,1};
+    label   = panels{p,2};
+    convert = panels{p,3};
+
+    subplot(2,2,p); hold on; grid on;
+
+    rawVal = rawSnapshot.channels.(field);
+    if ~isempty(rawVal) && numel(rawVal) == numel(rawT)
+        plot(rawT, convert(double(rawVal(:))), '-', 'Color', [0.65 0.65 0.65], ...
+            'LineWidth', 1, 'DisplayName', 'Raw (source)');
+    end
+
+    procVal = session.channels.(field);
+    if ~isempty(procVal) && numel(procVal) == numel(procT)
+        plotVal = convert(double(procVal(:)));
+        plotVal(~keepMask) = NaN;   % show only what was actually exported
+        plot(procT, plotVal, 'r-', 'LineWidth', 1.25, 'DisplayName', 'Processed (exported)');
+    end
+
+    xlabel('Time (s, source file time base)');
+    ylabel(label);
+    title(label);
+    legend('Location', 'best');
+end
+
+sgtitle(sprintf('Raw vs Processed - session "%s"', key), 'Interpreter', 'none');
+end
+
+function valF = adcToF(raw)
+valC = 0.246 .* (double(raw) - 406);
+valF = valC .* 9/5 + 32;
 end
