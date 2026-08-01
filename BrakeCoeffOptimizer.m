@@ -208,33 +208,33 @@ fprintf('\nData ranges used for bounds: T = [%.1f, %.1f] K, P_max = %.1f psi\n',
 % run_sim_opt, exactly as in the original brake_temp_sim.m.
 models = struct('name', {}, 'fun', {}, 'lb', {}, 'ub', {}, 'x0', {});
 
-% models(1).name = 'Linear in T only (current baseline)';
-% models(1).fun  = @(T, P, p) p(1).*T + p(2);
-% models(1).lb   = [-x2_bound, -b2_bound];
-% models(1).ub   = [ x2_bound,  b2_bound];
-% models(1).x0   = [x2_seed, b2_seed];
-% 
-% models(2).name = 'Linear, independent T and P';
-% models(2).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3);
-% models(2).lb   = [-x2_bound, -x3_bound, -b2_bound];
-% models(2).ub   = [ x2_bound,  x3_bound,  b2_bound];
-% models(2).x0   = [x2_seed, 0, b2_seed];
-% 
-% models(3).name = 'Linear with T*P interaction';
-% models(3).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3).*T.*P + p(4);
-% models(3).lb   = [-x2_bound, -x3_bound, -x4_bound, -b2_bound];
-% models(3).ub   = [ x2_bound,  x3_bound,  x4_bound,  b2_bound];
-% models(3).x0   = [x2_seed, 0, 0, b2_seed];
+models(1).name = 'Linear in T only (current baseline)';
+models(1).fun  = @(T, P, p) p(1).*T + p(2);
+models(1).lb   = [-x2_bound, -b2_bound];
+models(1).ub   = [ x2_bound,  b2_bound];
+models(1).x0   = [x2_seed, b2_seed];
 
-models(1).name = 'Quadratic in T, linear in P';
+models(2).name = 'Linear, independent T and P';
+models(2).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3);
+models(2).lb   = [-x2_bound, -x3_bound, -b2_bound];
+models(2).ub   = [ x2_bound,  x3_bound,  b2_bound];
+models(2).x0   = [x2_seed, 0, b2_seed];
+
+models(3).name = 'Linear with T*P interaction';
+models(3).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3).*T.*P + p(4);
+models(3).lb   = [-x2_bound, -x3_bound, -x4_bound, -b2_bound];
+models(3).ub   = [ x2_bound,  x3_bound,  x4_bound,  b2_bound];
+models(3).x0   = [x2_seed, 0, 0, b2_seed];
+
+models(4).name = 'Quadratic in T, linear in P';
 quad_bound = x2_bound / dT;
-models(1).fun  = @(T, P, p) p(1).*T + p(2).*T.^2 + p(3).*P + p(4);
-models(1).lb   = [-x2_bound, -quad_bound, -x3_bound, -b2_bound];
-models(1).ub   = [ x2_bound,  quad_bound,  x3_bound,  b2_bound];
-models(1).x0   = [x2_seed, 0, 0, b2_seed];
+models(4).fun  = @(T, P, p) p(1).*T + p(2).*T.^2 + p(3).*P + p(4);
+models(4).lb   = [-x2_bound, -quad_bound, -x3_bound, -b2_bound];
+models(4).ub   = [ x2_bound,  quad_bound,  x3_bound,  b2_bound];
+models(4).x0   = [x2_seed, 0, 0, b2_seed];
 
 %% ================== RUN OPTIMIZATION FOR EACH MODEL ==================
-opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 3000, ...
+opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 2000, ...
     'FunctionTolerance', 1e-10, 'StepTolerance', 1e-10);
 
 results = struct('name', {}, 'params', {}, 'h_w', {}, 'padfrac_params', {}, ...
