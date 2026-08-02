@@ -199,6 +199,28 @@ for g = 1:numel(sessionKeys)
                 0, NaN, NaN, NaN, "", "skipped_missing_temperature", 0);
             continue;
         end
+
+        if cfg.RejectImplausibleTempDatasets
+            plausFL = assessTemperaturePlausibility(session.channels.tempFLRaw, cfg);
+            plausFR = assessTemperaturePlausibility(session.channels.tempFRRaw, cfg);
+            plausRL = assessTemperaturePlausibility(session.channels.tempRLRaw, cfg);
+            plausRR = assessTemperaturePlausibility(session.channels.tempRRRaw, cfg);
+
+            fprintf('  Temperature plausibility: FL=%s FR=%s RL=%s RR=%s\n', ...
+                plausibilityLabel(plausFL), plausibilityLabel(plausFR), ...
+                plausibilityLabel(plausRL), plausibilityLabel(plausRR));
+
+            frontPlausible = plausFL.isPlausible || plausFR.isPlausible;
+            rearPlausible  = plausRL.isPlausible || plausRR.isPlausible;
+
+            if cfg.RequireTemperatureData && ~(frontPlausible && rearPlausible)
+                fprintf(['  Not exported: front and/or rear temperature channel(s) look ', ...
+                    'implausible (no sensor connected?).\n']);
+                manifestRows = appendManifestRow(manifestRows, session, readiness, ...
+                    0, NaN, NaN, NaN, "", "skipped_implausible_temperature", 0);
+                continue;
+            end
+        end
     
         wholeSegment = struct('startIndex', 1, 'endIndex', numel(session.time));
         [outMatrix, outHeaders, formatName] = buildOptimizerMatrix(session, wholeSegment, cfg);
@@ -433,7 +455,26 @@ cfg.CombineSegmentsIntoOneFile = true;
 % segment detection entirely - just reformat each session's full time
 % range into the optimizer's column layout and write it out as-is.
 % Useful when the input has already been trimmed/curated upstream.
-cfg.RawFormatOnly = false;
+cfg.RawFormatOnly = true;
+
+% Quick whole-session sanity check, currently applied in RawFormatOnly
+% mode: does a step further than "no filtering" only by rejecting entire
+% sessions whose temperature channels look like nothing is actually
+% connected to that ADC input - it does NOT trim, spike-filter, or clean
+% anything else. A channel is flagged as "no sensor connected" if either:
+%   - it is dead flat for the ENTIRE session (a floating/disconnected ADC
+%     pin reads a fixed rail voltage, not the small ambient drift a real
+%     sensor shows over a full driving session), or
+%   - almost all of its samples fall outside a wide, physically-sane
+%     temperature envelope once converted (ambient to red-hot).
+% This is coarser and cheaper than the per-sample plausibility clamp used
+% elsewhere in the pipeline (that one runs per-sample and only inside the
+% full cleaning path, which RawFormatOnly skips entirely).
+cfg.RejectImplausibleTempDatasets = true;
+cfg.ImplausibleTemperatureCheck.MinPlausible_C = -40;   % wide envelope: ambient to red-hot
+cfg.ImplausibleTemperatureCheck.MaxPlausible_C = 900;
+cfg.ImplausibleTemperatureCheck.MinStd_C = 0.5;         % below this, treat as a stuck/floating channel
+cfg.ImplausibleTemperatureCheck.MinPctInRange = 50;     % must have at least half its samples plausible
 
 % F34 vehicle values used only when motor RPM must be estimated from speed.
 cfg.GearRatio = 12.97;
@@ -2703,6 +2744,59 @@ if isempty(rows)
         'MissingChannels','EstimatedChannels','SourceFiles'});
 else
     manifest = struct2table(rows);
+end
+end
+
+%% Whole-dataset implausible-temperature check
+function plaus = assessTemperaturePlausibility(raw, cfg)
+% Looks at an ENTIRE session's worth of one raw temperature ADC channel
+% and decides whether it looks like a real connected sensor, as opposed
+% to a floating/disconnected ADC input. This is intentionally coarse (one
+% verdict for the whole channel) and cheap - it does not modify or trim
+% any data, it only informs whether the session should be exported.
+plaus = struct('isPlausible', false, 'reason', "no_data", 'pctInRange', NaN, 'stdC', NaN);
+
+raw = raw(:);
+finiteRaw = raw(isfinite(raw));
+if isempty(finiteRaw)
+    plaus.reason = "no_data";
+    return;
+end
+
+tempC = 0.246 .* (double(finiteRaw) - 406);
+plaus.stdC = std(tempC);
+
+if plaus.stdC < cfg.ImplausibleTemperatureCheck.MinStd_C
+    % A real sensor drifts at least a little over a full session (ambient
+    % change, self-heating, cooldown). A channel that is bit-for-bit flat
+    % for the whole file is far more consistent with a floating ADC pin
+    % parked at a fixed rail voltage than an actual connected sensor.
+    plaus.isPlausible = false;
+    plaus.reason = string(sprintf("flat_channel (std=%.2f C over full session)", plaus.stdC));
+    return;
+end
+
+inRange = tempC >= cfg.ImplausibleTemperatureCheck.MinPlausible_C & ...
+          tempC <= cfg.ImplausibleTemperatureCheck.MaxPlausible_C;
+plaus.pctInRange = 100 * sum(inRange) / numel(tempC);
+
+if plaus.pctInRange < cfg.ImplausibleTemperatureCheck.MinPctInRange
+    plaus.isPlausible = false;
+    plaus.reason = string(sprintf("out_of_range (%.1f%% of samples within %.0f-%.0f C)", ...
+        plaus.pctInRange, cfg.ImplausibleTemperatureCheck.MinPlausible_C, ...
+        cfg.ImplausibleTemperatureCheck.MaxPlausible_C));
+    return;
+end
+
+plaus.isPlausible = true;
+plaus.reason = "ok";
+end
+
+function label = plausibilityLabel(plaus)
+if plaus.isPlausible
+    label = "OK";
+else
+    label = string(sprintf("REJECTED(%s)", plaus.reason));
 end
 end
 
