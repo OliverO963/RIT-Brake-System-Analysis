@@ -31,9 +31,13 @@ function manifest = F34BrakeDataPreprocessor(inputFiles, outputFolder)
 %     to restore one output file per detected segment.
 %   - Motor RPM may be reconstructed from vehicle speed when RPM channels are
 %     absent. Longitudinal acceleration may be reconstructed from speed.
-%   - Startup temperature spikes are cleaned with a robust moving-median filter.
-%     Data before the first stable temperature window is trimmed, and output time
-%     is reset automatically. Files without a stable start can be skipped.
+%   - Temperature noise is cleaned across the complete session. Short EMI pulses
+%     that rise and return to the prior baseline are removed, while sustained
+%     thermal ramps are retained. Data before the first stable temperature window
+%     is trimmed, and output time is reset automatically.
+%   - Driving periods are kept in one thermal cycle when rotor temperature remains
+%     elevated through the stationary gap. Low-temperature sensor flatlines may be
+%     removed from the retained ranges.
 %
 %   Examples:
 %       manifest = F34BrakeDataPreprocessor;  % opens a file picker
@@ -257,8 +261,14 @@ for g = 1:numel(sessionKeys)
                 startupInfo.spikesReplaced);
         end
     elseif cfg.TemperatureStartup.Enable
-        fprintf('  Temperature startup cleaning: no stable start found (%s).\n', ...
-            startupInfo.reason);
+        if cfg.TemperatureStartup.RequireStableStart
+            fprintf('  Temperature startup cleaning: no stable start found (%s).\n', ...
+                startupInfo.reason);
+        else
+            fprintf(['  Temperature startup cleaning: no stable file-level start ', ...
+                'found (%s); continuing with per-stint thermal start filtering.\n'], ...
+                startupInfo.reason);
+        end
     end
 
     fprintf('  Usable temperature samples after merge/cleaning: front=%d, rear=%d\n', ...
@@ -281,7 +291,29 @@ for g = 1:numel(sessionKeys)
         continue;
     end
 
-    segments = detectSegments(session, cfg);
+    [segments, segmentInfo] = detectSegments(session, cfg);
+
+    if segmentInfo.thermalMerges > 0
+        fprintf(['  Thermal continuity: merged %d movement gap(s) because ', ...
+            'temperature remained elevated.\n'], ...
+            segmentInfo.thermalMerges);
+    end
+    if segmentInfo.flatlineSamplesRemoved > 0
+        fprintf(['  Low-temperature flatline filtering: excluded %.1f s ', ...
+            'of stationary data.\n'], ...
+            segmentInfo.flatlineDuration_s);
+    end
+    if segmentInfo.hotStartSegmentsSkipped > 0
+        fprintf(['  Start-condition filtering: skipped %d orphan hot-start ', ...
+            'segment(s) above %.0f F.\n'], ...
+            segmentInfo.hotStartSegmentsSkipped, ...
+            cfg.ThermalContinuity.NewCycleMaxStart_F);
+    end
+    if segmentInfo.hotStartSegmentsMerged > 0
+        fprintf(['  Start-condition filtering: merged %d hot-start segment(s) ', ...
+            'back into the preceding thermal cycle.\n'], ...
+            segmentInfo.hotStartSegmentsMerged);
+    end
 
     if isempty(segments)
         fprintf('  No driving segments met the configured thresholds.\n');
@@ -488,11 +520,13 @@ cfg.RequireTemperatureData = true;
 cfg.MinimumTemperatureSamples = 10;
 
 % Startup temperature cleaning. Analog temperature sensors can experience
-% EMI spikes while the HV system is energizing. The preprocessor replaces
-% isolated spikes, locates the first persistent stable temperature window,
-% trims earlier rows, and resets the session time without forcing ambient.
+% EMI spikes while the HV system is energizing. The preprocessor filters
+% pulse-shaped EMI excursions across the full file, locates the first
+% persistent stable temperature window, trims earlier rows, and resets the
+% session time without forcing ambient. Per-stint hot-start logic is applied
+% later by the thermal-continuity segmenter.
 cfg.TemperatureStartup.Enable = true;
-cfg.TemperatureStartup.RequireStableStart = true;
+cfg.TemperatureStartup.RequireStableStart = false;  % per-stint thermal start filter decides export
 cfg.TemperatureStartup.StabilityWindow_s = 3.0;
 cfg.TemperatureStartup.ConfirmationWindow_s = 3.0;
 cfg.TemperatureStartup.MaximumSearchTime_s = 25.0;
@@ -523,20 +557,48 @@ cfg.TemperatureStartup.MaximumPlausible_C = 800;
 % copied across an axle unless this is explicitly enabled.
 cfg.CopyMissingTemperatureAcrossAxle = false;
 
-% Robust isolated-spike filter. Applied across the ENTIRE file, not just
-% the startup window: a rotor has enough thermal mass that a genuine
-% temperature change can't spike and fall back to ambient within a
-% couple of seconds, so an isolated spike-then-return pattern anywhere
-% in the file is sensor/EMI noise, not real physics. The filter compares
-% each sample against a local robust median (movmedian) and only
-% replaces points that deviate more than a MAD-based threshold, so a
-% genuine multi-sample heating RAMP (which stays elevated, not an
-% isolated point) is left untouched.
+% Temperature pulse / spike filter. This is applied across the ENTIRE
+% file because the analog sensor wiring remains in a high-EMI environment.
+% A real rotor-temperature increase may be rapid, but a 250-350 F rise that
+% returns to the previous level within roughly two seconds is not credible
+% bulk-rotor thermal behavior. The filter therefore removes only SHORT
+% excursions that RETURN to the same baseline; sustained ramps and plateaus
+% remain untouched.
 cfg.TemperatureStartup.SpikeFilter.Enable = true;
 cfg.TemperatureStartup.SpikeFilter.ApplyToEntireFile = true;
-cfg.TemperatureStartup.SpikeFilter.Window_s = 1.0;
-cfg.TemperatureStartup.SpikeFilter.MinimumDeviation_C = 12.0;
+cfg.TemperatureStartup.SpikeFilter.Window_s = 7.0;              % robust baseline window
+cfg.TemperatureStartup.SpikeFilter.ShortWindow_s = 1.0;         % single-sample cleanup
+cfg.TemperatureStartup.SpikeFilter.MinimumDeviation_F = 35.0;   % pulse amplitude threshold
+cfg.TemperatureStartup.SpikeFilter.MaximumPulseDuration_s = 3.0;
+cfg.TemperatureStartup.SpikeFilter.ReturnTolerance_F = 15.0;
+cfg.TemperatureStartup.SpikeFilter.BaselineWindow_s = 2.0;
+cfg.TemperatureStartup.SpikeFilter.CandidateGap_s = 0.30;
+cfg.TemperatureStartup.SpikeFilter.EdgeExpansionFraction = 0.30;
 cfg.TemperatureStartup.SpikeFilter.MadFactor = 6.0;
+
+% Thermal-cycle continuity. Do not create a new stint merely because the
+% vehicle stopped if rotor temperature remains consistently elevated in
+% the gap. This preserves cooldown behavior and prevents a later movement
+% period from being exported as a new "cycle" starting near 500 F.
+cfg.ThermalContinuity.Enable = true;
+cfg.ThermalContinuity.MergeAbove_F = 300.0;
+cfg.ThermalContinuity.MinimumElevatedFraction = 0.85;
+cfg.ThermalContinuity.MaximumGap_s = 900.0;
+cfg.ThermalContinuity.NewCycleMaxStart_F = 300.0;
+cfg.ThermalContinuity.StartWindow_s = 3.0;
+cfg.ThermalContinuity.SkipOrphanHotStarts = true;
+
+% Low-temperature flatline removal. A long, nearly horizontal signal at
+% <=300 F is treated as an inactive/frozen sensor region only when the car
+% is stationary. The +/-5 F requirement corresponds to a 10 F total range.
+% Requiring both front and rear axle temperatures avoids deleting data
+% because one corner sensor alone becomes stuck.
+cfg.TemperaturePlateau.Enable = true;
+cfg.TemperaturePlateau.MaximumTemperature_F = 300.0;
+cfg.TemperaturePlateau.MaximumRange_F = 10.0;
+cfg.TemperaturePlateau.MinimumDuration_s = 45.0;
+cfg.TemperaturePlateau.MaximumSpeed_mps = 0.5;
+cfg.TemperaturePlateau.RequireBothAxles = true;
 
 % Safety policy for incomplete data.
 % The supplied optimizer uses motor torque to calculate regen energy. Keeping
@@ -1692,6 +1754,15 @@ end
 end
 
 function [filteredC, replacedCount] = filterTemperatureSpikes(tempC, time, startupCfg)
+% Remove two different EMI artifacts:
+%   1) isolated single-sample outliers, using a short robust median; and
+%   2) short pulse-shaped excursions that return to the same baseline.
+%
+% The second test is deliberately shape-based. A sustained temperature
+% increase is retained even when its amplitude is large. A pulse is replaced
+% only when it lasts no longer than MaximumPulseDuration_s and the medians
+% immediately before and after it agree within ReturnTolerance_F.
+
 filteredC = tempC;
 replacedCount = 0;
 if ~startupCfg.SpikeFilter.Enable || isempty(tempC)
@@ -1703,11 +1774,6 @@ if ~isfinite(dt) || dt <= 0
     return;
 end
 
-windowSamples = max(3, round(startupCfg.SpikeFilter.Window_s/dt));
-if mod(windowSamples,2) == 0
-    windowSamples = windowSamples + 1;
-end
-
 if startupCfg.SpikeFilter.ApplyToEntireFile
     filterEnd = size(tempC,1);
 else
@@ -1717,20 +1783,113 @@ else
     end
 end
 
+shortSamples = oddWindowSamples( ...
+    startupCfg.SpikeFilter.ShortWindow_s, dt, 3);
+baselineSamples = oddWindowSamples( ...
+    startupCfg.SpikeFilter.Window_s, dt, 5);
+edgeSamples = max(1, round( ...
+    startupCfg.SpikeFilter.BaselineWindow_s / dt));
+maximumPulseSamples = max(1, round( ...
+    startupCfg.SpikeFilter.MaximumPulseDuration_s / dt));
+candidateGapSamples = max(0, round( ...
+    startupCfg.SpikeFilter.CandidateGap_s / dt));
+
+minimumDeviation_C = startupCfg.SpikeFilter.MinimumDeviation_F * (5/9);
+returnTolerance_C = startupCfg.SpikeFilter.ReturnTolerance_F * (5/9);
+edgeThreshold_C = minimumDeviation_C * ...
+    startupCfg.SpikeFilter.EdgeExpansionFraction;
+
 for channel = 1:size(tempC,2)
     x = tempC(1:filterEnd,channel);
-    if sum(isfinite(x)) < 3
+    if sum(isfinite(x)) < max(5, shortSamples)
         continue;
     end
-    localMedian = movmedian(x, windowSamples, 'omitnan', 'Endpoints', 'shrink');
-    deviation = abs(x-localMedian);
-    localMad = movmedian(deviation, windowSamples, 'omitnan', 'Endpoints', 'shrink');
-    threshold = max(startupCfg.SpikeFilter.MinimumDeviation_C, ...
+
+    % Pass 1: isolated point cleanup.
+    shortMedian = movmedian(x, shortSamples, ...
+        'omitnan', 'Endpoints', 'shrink');
+    pointDeviation = abs(x-shortMedian);
+    localMad = movmedian(pointDeviation, shortSamples, ...
+        'omitnan', 'Endpoints', 'shrink');
+    pointThreshold = max(minimumDeviation_C, ...
         startupCfg.SpikeFilter.MadFactor .* 1.4826 .* localMad);
-    spike = isfinite(x) & isfinite(localMedian) & deviation > threshold;
-    x(spike) = localMedian(spike);
+    pointSpike = isfinite(x) & isfinite(shortMedian) & ...
+        pointDeviation > pointThreshold;
+    x(pointSpike) = shortMedian(pointSpike);
+    replacedCount = replacedCount + sum(pointSpike);
+
+    % Pass 2: pulse-shaped excursions up to a few seconds long.
+    robustBaseline = movmedian(x, baselineSamples, ...
+        'omitnan', 'Endpoints', 'shrink');
+    residual = x - robustBaseline;
+    pulseCandidate = isfinite(x) & isfinite(robustBaseline) & ...
+        abs(residual) >= minimumDeviation_C;
+    if candidateGapSamples > 0
+        pulseCandidate = bridgeShortFalseRuns( ...
+            pulseCandidate, candidateGapSamples);
+    end
+
+    pulseRuns = logicalRuns(pulseCandidate);
+    for runNumber = 1:size(pulseRuns,1)
+        firstIndex = pulseRuns(runNumber,1);
+        lastIndex = pulseRuns(runNumber,2);
+
+        % Include the shoulders of a triangular pulse so a small part of the
+        % EMI excursion is not left behind after the peak itself is replaced.
+        while firstIndex > 1 && ...
+                isfinite(residual(firstIndex-1)) && ...
+                abs(residual(firstIndex-1)) >= edgeThreshold_C && ...
+                (lastIndex-firstIndex+2) <= maximumPulseSamples
+            firstIndex = firstIndex - 1;
+        end
+        while lastIndex < numel(x) && ...
+                isfinite(residual(lastIndex+1)) && ...
+                abs(residual(lastIndex+1)) >= edgeThreshold_C && ...
+                (lastIndex-firstIndex+2) <= maximumPulseSamples
+            lastIndex = lastIndex + 1;
+        end
+
+        if (lastIndex-firstIndex+1) > maximumPulseSamples
+            continue;
+        end
+
+        beforeIndex = max(1, firstIndex-edgeSamples):(firstIndex-1);
+        afterIndex = (lastIndex+1):min(numel(x), lastIndex+edgeSamples);
+        if isempty(beforeIndex) || isempty(afterIndex)
+            continue;
+        end
+
+        beforeLevel = median(x(beforeIndex),'omitnan');
+        afterLevel = median(x(afterIndex),'omitnan');
+        if ~isfinite(beforeLevel) || ~isfinite(afterLevel) || ...
+                abs(afterLevel-beforeLevel) > returnTolerance_C
+            continue;
+        end
+
+        pulseValues = x(firstIndex:lastIndex);
+        referenceLevel = 0.5*(beforeLevel+afterLevel);
+        pulseAmplitude = max(abs(pulseValues-referenceLevel),[],'omitnan');
+        if ~isfinite(pulseAmplitude) || pulseAmplitude < minimumDeviation_C
+            continue;
+        end
+
+        replacement = linspace(beforeLevel, afterLevel, ...
+            lastIndex-firstIndex+3).';
+        replacement = replacement(2:end-1);
+        finitePulse = isfinite(pulseValues);
+        pulseValues(finitePulse) = replacement(finitePulse);
+        x(firstIndex:lastIndex) = pulseValues;
+        replacedCount = replacedCount + sum(finitePulse);
+    end
+
     filteredC(1:filterEnd,channel) = x;
-    replacedCount = replacedCount + sum(spike);
+end
+end
+
+function samples = oddWindowSamples(window_s, dt, minimumSamples)
+samples = max(minimumSamples, round(window_s/dt));
+if mod(samples,2) == 0
+    samples = samples + 1;
 end
 end
 
@@ -1803,9 +1962,16 @@ end
 end
 
 %% Segment detection
-function segments = detectSegments(session, cfg)
+function [segments, info] = detectSegments(session, cfg)
 t = session.time(:);
 c = session.channels;
+info = struct( ...
+    'thermalMerges', 0, ...
+    'flatlineSamplesRemoved', 0, ...
+    'flatlineDuration_s', 0, ...
+    'hotStartSegmentsSkipped', 0, ...
+    'hotStartSegmentsMerged', 0);
+
 if numel(t) < 3
     segments = struct([]);
     return;
@@ -1818,6 +1984,10 @@ if ~isfinite(dt) || dt <= 0
 end
 
 movementMask = buildMovementMask(c, t, cfg);
+flatlineMask = detectLowTemperatureFlatlines( ...
+    session, movementMask, cfg, dt);
+info.flatlineSamplesRemoved = sum(flatlineMask);
+info.flatlineDuration_s = sum(flatlineMask) * dt;
 
 switch session.kind
     case "endurance_stint"
@@ -1837,22 +2007,21 @@ switch session.kind
         mask = movementMask;
 end
 
+% A confirmed low-temperature flatline is a hard cut. It must not be
+% reintroduced later by activity-gap bridging or pre/post padding.
+mask(flatlineMask) = false;
+
 % --- Noise robustness -----------------------------------------------
-% Drop isolated blips (a handful of noisy samples) BEFORE bridging, so a
-% cluster of brief sensor glitches can't be stitched together into
-% something that merely spans long enough to pass MinimumDuration_s.
 prebridgeMinSamples = max(2, round(cfg.NoiseRejection.MinRawBlip_s/dt));
 mask = removeShortTrueRuns(mask, prebridgeMinSamples);
 rawMaskBeforeBridge = mask;
 
 mask = bridgeShortFalseRuns(mask, round(settings.MergeIdleGap_s/dt));
+mask(flatlineMask) = false;
 
-% Reject bridged runs that are mostly gap and only briefly touched real
-% activity (e.g. a couple of seconds of a spiking sensor followed by a
-% long idle gap, bridged together with another such spike). A genuine
-% driving stint has activity sustained throughout its span, not just a
-% low-duty-cycle sprinkling of it.
-mask = enforceActivityDensity(mask, rawMaskBeforeBridge, cfg.NoiseRejection.MinActivityDensity);
+mask = enforceActivityDensity(mask, rawMaskBeforeBridge, ...
+    cfg.NoiseRejection.MinActivityDensity);
+mask(flatlineMask) = false;
 
 mask = removeShortTrueRuns(mask, round(settings.MinimumDuration_s/dt));
 runs = logicalRuns(mask);
@@ -1862,15 +2031,12 @@ if isempty(runs)
     return;
 end
 
-% Retain data before the detected driving period and after it so rotor
-% cold-start and cooldown behavior remain available to BrakeCoeffOptimizer.
-% Padding reaches back toward the END of the PREVIOUS stint (or the start
-% of the file, for the first stint) and forward toward the START of the
-% NEXT stint (or the end of the file, for the last stint), each bounded
-% by a generous cap (settings.PrePadding_s / PostCooldown_s) so an
-% unreasonably long idle gap between stints isn't pulled in wholesale.
-% When two stints are close enough that their padded windows overlap,
-% mergeOverlappingSegments below stitches them into one continuous file.
+% Preserve thermal continuity across stationary gaps. A short speed-zero
+% period is not a new thermal cycle when the temperature stays elevated.
+[runs, thermalMergeCount] = mergeRunsAcrossElevatedTemperature( ...
+    runs, session, flatlineMask, cfg, dt);
+info.thermalMerges = thermalMergeCount;
+
 prePaddingCap = round(settings.PrePadding_s/dt);
 postCooldownCap = round(settings.PostCooldown_s/dt);
 
@@ -1888,13 +2054,39 @@ for r = 1:nRuns
         nextRunStart = runs(r+1,1);
     end
 
-    segments(r).startIndex = max([1, prevRunEnd+1, runs(r,1)-prePaddingCap]);
-    segments(r).endIndex   = min([numel(t), nextRunStart-1, runs(r,2)+postCooldownCap]);
+    candidateStart = max([1, prevRunEnd+1, ...
+        runs(r,1)-prePaddingCap]);
+    candidateEnd = min([numel(t), nextRunStart-1, ...
+        runs(r,2)+postCooldownCap]);
+
+    % Do not pad through a detected frozen/flat low-temperature region.
+    previousBarrier = find(flatlineMask(1:max(1,runs(r,1)-1)), ...
+        1, 'last');
+    if ~isempty(previousBarrier)
+        candidateStart = max(candidateStart, previousBarrier+1);
+    end
+    followingBarrierRelative = find( ...
+        flatlineMask(min(numel(t),runs(r,2)+1):end), 1, 'first');
+    if ~isempty(followingBarrierRelative)
+        followingBarrier = min(numel(t),runs(r,2)+1) + ...
+            followingBarrierRelative - 1;
+        candidateEnd = min(candidateEnd, followingBarrier-1);
+    end
+
+    segments(r).startIndex = candidateStart;
+    segments(r).endIndex = candidateEnd;
 end
 
-% If a cooldown window reaches the following stint, retain the whole
-% transition as one continuous segment rather than duplicating samples.
 segments = mergeOverlappingSegments(segments);
+
+% A new exported cycle should not begin at a very high temperature. If a
+% later segment begins hot, attach it to the previous thermal cycle. If the
+% file itself begins hot and no low-temperature pre-movement point exists,
+% omit that orphan partial cycle rather than labeling 500 F as a new start.
+[segments, startInfo] = enforceThermalCycleStarts( ...
+    segments, movementMask, flatlineMask, session, cfg, dt);
+info.hotStartSegmentsSkipped = startInfo.skipped;
+info.hotStartSegmentsMerged = startInfo.merged;
 end
 
 function mask = enforceActivityDensity(bridgedMask, rawMask, minDensity)
@@ -2054,6 +2246,225 @@ changes = diff([false; mask; false]);
 starts = find(changes == 1);
 ends = find(changes == -1)-1;
 runs = [starts, ends];
+end
+
+function flatlineMask = detectLowTemperatureFlatlines( ...
+        session, movementMask, cfg, dt)
+n = numel(session.time);
+flatlineMask = false(n,1);
+if ~cfg.TemperaturePlateau.Enable || n < 3
+    return;
+end
+
+[frontF, rearF, ~] = representativeTemperatureF(session.channels, n);
+frontFlat = detectOneLowTemperatureFlatline(frontF, cfg, dt);
+rearFlat = detectOneLowTemperatureFlatline(rearF, cfg, dt);
+
+if cfg.TemperaturePlateau.RequireBothAxles
+    flatlineMask = frontFlat & rearFlat;
+else
+    flatlineMask = frontFlat | rearFlat;
+end
+
+% Only cut stationary sections. This prevents a failed sensor from deleting
+% a real driving interval solely because its reading is stuck.
+stationary = ~movementMask;
+if ~isempty(session.channels.speed) && ...
+        numel(session.channels.speed) == n
+    speed = abs(double(session.channels.speed(:)));
+    speedStationary = ~isfinite(speed) | ...
+        speed <= cfg.TemperaturePlateau.MaximumSpeed_mps;
+    stationary = stationary & speedStationary;
+end
+flatlineMask = flatlineMask & stationary;
+flatlineMask = removeShortTrueRuns(flatlineMask, ...
+    max(2, round(cfg.TemperaturePlateau.MinimumDuration_s/dt)));
+end
+
+function flatMask = detectOneLowTemperatureFlatline(tempF, cfg, dt)
+n = numel(tempF);
+flatMask = false(n,1);
+if isempty(tempF) || sum(isfinite(tempF)) < 3
+    return;
+end
+
+windowSamples = oddWindowSamples( ...
+    cfg.TemperaturePlateau.MinimumDuration_s, dt, 3);
+localMaximum = movmax(tempF, windowSamples, ...
+    'omitnan', 'Endpoints', 'shrink');
+localMinimum = movmin(tempF, windowSamples, ...
+    'omitnan', 'Endpoints', 'shrink');
+localMedian = movmedian(tempF, windowSamples, ...
+    'omitnan', 'Endpoints', 'shrink');
+
+core = isfinite(tempF) & isfinite(localMaximum) & ...
+    isfinite(localMinimum) & isfinite(localMedian) & ...
+    (localMaximum-localMinimum) <= ...
+        cfg.TemperaturePlateau.MaximumRange_F & ...
+    localMedian <= cfg.TemperaturePlateau.MaximumTemperature_F;
+
+% A centered 45-second window identifies the plateau interior. Expand the
+% identified core by half a window to recover the complete frozen interval.
+coreRuns = logicalRuns(core);
+halfWindow = floor(windowSamples/2);
+for r = 1:size(coreRuns,1)
+    firstIndex = max(1, coreRuns(r,1)-halfWindow);
+    lastIndex = min(n, coreRuns(r,2)+halfWindow);
+    flatMask(firstIndex:lastIndex) = true;
+end
+
+flatMask = removeShortTrueRuns(flatMask, ...
+    max(2, round(cfg.TemperaturePlateau.MinimumDuration_s/dt)));
+end
+
+function [mergedRuns, mergeCount] = mergeRunsAcrossElevatedTemperature( ...
+        runs, session, flatlineMask, cfg, dt)
+mergedRuns = runs;
+mergeCount = 0;
+if ~cfg.ThermalContinuity.Enable || size(runs,1) <= 1
+    return;
+end
+
+[~, ~, representativeF] = representativeTemperatureF( ...
+    session.channels, numel(session.time));
+if isempty(representativeF) || sum(isfinite(representativeF)) < 3
+    return;
+end
+
+maximumGapSamples = max(1, round( ...
+    cfg.ThermalContinuity.MaximumGap_s/dt));
+startWindowSamples = max(1, round( ...
+    cfg.ThermalContinuity.StartWindow_s/dt));
+
+mergedRuns = runs(1,:);
+for r = 2:size(runs,1)
+    previousEnd = mergedRuns(end,2);
+    nextStart = runs(r,1);
+    gapStart = previousEnd + 1;
+    gapEnd = nextStart - 1;
+    gapLength = max(0, gapEnd-gapStart+1);
+
+    shouldMerge = false;
+    if gapLength > 0 && gapLength <= maximumGapSamples && ...
+            ~any(flatlineMask(gapStart:gapEnd))
+        gapTemperature = representativeF(gapStart:gapEnd);
+        validGap = isfinite(gapTemperature);
+        if any(validGap)
+            elevatedFraction = mean(gapTemperature(validGap) >= ...
+                cfg.ThermalContinuity.MergeAbove_F);
+            nextWindowEnd = min(numel(representativeF), ...
+                nextStart+startWindowSamples-1);
+            nextStartTemperature = median( ...
+                representativeF(nextStart:nextWindowEnd), 'omitnan');
+            shouldMerge = elevatedFraction >= ...
+                cfg.ThermalContinuity.MinimumElevatedFraction && ...
+                isfinite(nextStartTemperature) && ...
+                nextStartTemperature >= ...
+                cfg.ThermalContinuity.NewCycleMaxStart_F;
+        end
+    end
+
+    if shouldMerge
+        mergedRuns(end,2) = runs(r,2);
+        mergeCount = mergeCount + 1;
+    else
+        mergedRuns(end+1,:) = runs(r,:); %#ok<AGROW>
+    end
+end
+end
+
+function [segments, info] = enforceThermalCycleStarts( ...
+        segments, movementMask, flatlineMask, session, cfg, dt)
+info = struct('skipped',0,'merged',0);
+if isempty(segments) || ~cfg.ThermalContinuity.Enable
+    return;
+end
+
+[~, ~, representativeF] = representativeTemperatureF( ...
+    session.channels, numel(session.time));
+if isempty(representativeF) || sum(isfinite(representativeF)) < 3
+    return;
+end
+
+windowSamples = oddWindowSamples( ...
+    cfg.ThermalContinuity.StartWindow_s, dt, 3);
+smoothedTemperature = movmedian(representativeF, windowSamples, ...
+    'omitnan', 'Endpoints', 'shrink');
+lowEnough = isfinite(smoothedTemperature) & ...
+    smoothedTemperature <= cfg.ThermalContinuity.NewCycleMaxStart_F;
+
+kept = struct([]);
+for s = 1:numel(segments)
+    seg = segments(s);
+    firstMovementRelative = find( ...
+        movementMask(seg.startIndex:seg.endIndex), 1, 'first');
+    if isempty(firstMovementRelative)
+        continue;
+    end
+    firstMovement = seg.startIndex + firstMovementRelative - 1;
+
+    startWindowEnd = min(seg.endIndex, ...
+        seg.startIndex+windowSamples-1);
+    startTemperature = median( ...
+        representativeF(seg.startIndex:startWindowEnd), 'omitnan');
+
+    if isfinite(startTemperature) && ...
+            startTemperature > cfg.ThermalContinuity.NewCycleMaxStart_F
+        lowBeforeMovement = find( ...
+            lowEnough(seg.startIndex:firstMovement), 1, 'last');
+
+        if ~isempty(lowBeforeMovement)
+            seg.startIndex = seg.startIndex + lowBeforeMovement - 1;
+        elseif ~isempty(kept) && ...
+                ~any(flatlineMask(kept(end).endIndex:seg.startIndex))
+            kept(end).endIndex = max(kept(end).endIndex, seg.endIndex);
+            info.merged = info.merged + 1;
+            continue;
+        elseif cfg.ThermalContinuity.SkipOrphanHotStarts
+            info.skipped = info.skipped + 1;
+            continue;
+        end
+    end
+
+    if isempty(kept)
+        kept = seg;
+    else
+        kept(end+1) = seg; %#ok<AGROW>
+    end
+end
+segments = kept;
+end
+
+function [frontF, rearF, representativeF] = representativeTemperatureF(c, n)
+frontMatrix = nan(n,2);
+rearMatrix = nan(n,2);
+
+if ~isempty(c.tempFLRaw) && numel(c.tempFLRaw) == n
+    frontMatrix(:,1) = adcToF(double(c.tempFLRaw(:)));
+end
+if ~isempty(c.tempFRRaw) && numel(c.tempFRRaw) == n
+    frontMatrix(:,2) = adcToF(double(c.tempFRRaw(:)));
+end
+if ~isempty(c.tempRLRaw) && numel(c.tempRLRaw) == n
+    rearMatrix(:,1) = adcToF(double(c.tempRLRaw(:)));
+end
+if ~isempty(c.tempRRRaw) && numel(c.tempRRRaw) == n
+    rearMatrix(:,2) = adcToF(double(c.tempRRRaw(:)));
+end
+
+frontF = median(frontMatrix,2,'omitnan');
+rearF = median(rearMatrix,2,'omitnan');
+representativeF = median([frontF rearF],2,'omitnan');
+
+if all(~isfinite(frontF))
+    frontF = nan(n,1);
+end
+if all(~isfinite(rearF))
+    rearF = nan(n,1);
+end
+if all(~isfinite(representativeF))
+    representativeF = nan(n,1);
+end
 end
 
 function segments = mergeOverlappingSegments(segments)
