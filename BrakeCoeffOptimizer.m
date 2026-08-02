@@ -201,6 +201,61 @@ x4_bound = 1.5 / (dT * dP);   % 1/(K*psi)
 b2_bound = 1.5;
 
 fprintf('\nData ranges used for bounds: T = [%.1f, %.1f] K, P_max = %.1f psi\n', Tmin_K, Tmax_K, Pmax);
+Tmid_K = (Tmin_K + Tmax_K) / 2;
+Pmid   = Pmax / 2;
+
+%% ================== PHYSICALLY-GROUNDED PADFRAC ANCHOR ==================
+% Classical heat-partition theory (Charron's relation / Newcomb) gives the
+% steady-state fraction of frictional energy absorbed by each body from
+% their thermal effusivity xi = sqrt(k*rho*cp), for equal/overlapping
+% contact area (the pad's footprint on the rotor is the same patch for
+% both bodies, so area cancels out of the ratio):
+%
+%   PadFrac_ideal = xi_pad / (xi_pad + xi_rotor)
+%
+% Unlike a pressure term in an unconstrained linear fit, this value
+% cannot run away to 0 or blow up with extrapolation - it's a fixed
+% material property ratio. Physically, published thermal-contact-
+% conductance literature (Cooper-Mikic-Yovanovich and related work)
+% shows contact conductance INCREASING (not decreasing) with clamping
+% pressure as surface asperities flatten, so if anything real pressure
+% dependence should pull PadFrac TOWARD this ideal value as pressure
+% rises, not away from it - the opposite of collapsing to zero.
+
+% Rotor: normalized 4130 alloy steel (MatWeb datasheet, ~100-300 C range)
+k_rotor   = 42.7;    % W/m-K
+rho_rotor = 7850;    % kg/m^3
+cp_rotor  = 477;     % J/kg-K
+xi_rotor  = sqrt(k_rotor * rho_rotor * cp_rotor);
+
+% Pad: Porterfield R4-1 (carbon-Kevlar semi-metallic composite). Porterfield
+% does not publish k/rho/cp for this compound, so these are literature
+% estimates for comparable semi-metallic friction composites, NOT a
+% manufacturer-certified value - treat PadFrac_ideal as a sanity-check
+% anchor/starting point, not ground truth:
+%   k  ~ 2-5 W/m-K   (semi-metallic composites w/ steel/Kevlar fiber content)
+%   rho~ 2000-2500 kg/m^3
+%   cp ~ 800-1200 J/kg-K
+k_pad_lo = 2.0; k_pad_mid = 3.0; k_pad_hi = 5.0;
+rho_pad_lo = 2000; rho_pad_mid = 2200; rho_pad_hi = 2500;
+cp_pad_lo = 800; cp_pad_mid = 1000; cp_pad_hi = 1200;
+
+xi_pad_lo  = sqrt(k_pad_lo  * rho_pad_lo  * cp_pad_lo);
+xi_pad_mid = sqrt(k_pad_mid * rho_pad_mid * cp_pad_mid);
+xi_pad_hi  = sqrt(k_pad_hi  * rho_pad_hi  * cp_pad_hi);
+
+PadFrac_ideal_lo  = xi_pad_lo  / (xi_pad_lo  + xi_rotor);
+PadFrac_ideal     = xi_pad_mid / (xi_pad_mid + xi_rotor);   % central estimate, used below
+PadFrac_ideal_hi  = xi_pad_hi  / (xi_pad_hi  + xi_rotor);
+
+fprintf('\n================ PHYSICALLY-GROUNDED PADFRAC ANCHOR ================\n');
+fprintf('Rotor (4130 steel) effusivity:  %.0f J/(m^2*K*sqrt(s))\n', xi_rotor);
+fprintf('Pad (R4-1, estimated) effusivity: %.0f J/(m^2*K*sqrt(s)) [range %.0f-%.0f]\n', ...
+    xi_pad_mid, xi_pad_lo, xi_pad_hi);
+fprintf('PadFrac_ideal = %.3f  (estimated range %.3f - %.3f)\n', ...
+    PadFrac_ideal, PadFrac_ideal_lo, PadFrac_ideal_hi);
+fprintf('This is a starting-point anchor, not a certified value - Porterfield does\n');
+fprintf('not publish R4-1''s thermal properties. Used to seed/bound models 5 and 6 below.\n');
 
 %% ================== CANDIDATE PAD-FRACTION MODELS ==================
 % Each model computes the RAW (pre-clamp) PadFrac from rotor temp (K)
@@ -216,74 +271,152 @@ models(1).x0   = [x2_seed, b2_seed];
 
 models(2).name = 'Linear, independent T and P';
 models(2).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3);
-models(2).lb   = [-x2_bound, -x3_bound, -b2_bound];
-models(2).ub   = [ x2_bound,  x3_bound,  b2_bound];
+% p(2) (direct pressure term) is bounded >= 0: thermal-contact-conductance
+% literature (Cooper-Mikic-Yovanovich) shows contact conductance can only
+% increase or stay flat with clamping pressure as asperities flatten, never
+% decrease - a negative pressure sensitivity has no physical basis, and
+% allowing it is what let this model collapse PadFrac to zero at high P.
+models(2).lb   = [-x2_bound, 0, -b2_bound];
+models(2).ub   = [ x2_bound, x3_bound, b2_bound];
 models(2).x0   = [x2_seed, 0, b2_seed];
 
 models(3).name = 'Linear with T*P interaction';
 models(3).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3).*T.*P + p(4);
-models(3).lb   = [-x2_bound, -x3_bound, -x4_bound, -b2_bound];
-models(3).ub   = [ x2_bound,  x3_bound,  x4_bound,  b2_bound];
+% p(2) (direct P term) non-negative for the same reason as model 2. The
+% interaction term p(3) is left unconstrained in sign since there isn't a
+% clear physical prior for how P's effect should change with T.
+models(3).lb   = [-x2_bound, 0, -x4_bound, -b2_bound];
+models(3).ub   = [ x2_bound, x3_bound, x4_bound,  b2_bound];
 models(3).x0   = [x2_seed, 0, 0, b2_seed];
 
 models(4).name = 'Quadratic in T, linear in P';
 quad_bound = x2_bound / dT;
 models(4).fun  = @(T, P, p) p(1).*T + p(2).*T.^2 + p(3).*P + p(4);
-models(4).lb   = [-x2_bound, -quad_bound, -x3_bound, -b2_bound];
-models(4).ub   = [ x2_bound,  quad_bound,  x3_bound,  b2_bound];
+models(4).lb   = [-x2_bound, -quad_bound, 0, -b2_bound];
+models(4).ub   = [ x2_bound,  quad_bound, x3_bound,  b2_bound];
 models(4).x0   = [x2_seed, 0, 0, b2_seed];
+
+models(5).name = 'Anchored to effusivity-based ideal (small T,P correction)';
+% PadFrac = PadFrac_ideal + a small correction. Unlike models 1-4, this
+% model doesn't fit the partition ratio from scratch - it stays tethered
+% to the physically-computed anchor and only lets the optimizer nudge it
+% within a tight band, which is the "decouple from the anchor" approach
+% suggested by the effusivity theory above. p(1),p(2) are the correction's
+% full swing across the observed T/P range; p(3) is a small constant offset.
+anchor_correction_bound = 0.15;   % max additional swing away from the anchor
+models(5).fun  = @(T, P, p) PadFrac_ideal + p(1).*(T-Tmid_K)/dT + p(2).*(P-Pmid)/dP + p(3);
+models(5).lb   = [-anchor_correction_bound, -anchor_correction_bound, -0.05];
+models(5).ub   = [ anchor_correction_bound,  anchor_correction_bound,  0.05];
+models(5).x0   = [0, 0, 0];
+
+models(6).name = 'Saturating logistic in T,P (bounded, cannot collapse to 0)';
+% PadFrac = PadMax / (1 + exp(-(slope terms))). This form is bounded in
+% [0, PadMax] by construction for ANY coefficient values - it cannot be
+% driven to 0 or blow up by extrapolating past the well-sampled pressure
+% range the way an unbounded linear/polynomial term can. PadMax is itself
+% fit, with bounds informed by the effusivity-based anchor above (given
+% generous headroom since the anchor is a rough estimate).
+padmax_lb = max(0.02, PadFrac_ideal_lo * 0.5);
+padmax_ub = min(0.6,  PadFrac_ideal_hi * 2.5);
+models(6).fun  = @(T, P, p) p(1) ./ (1 + exp(-(p(2).*(T-Tmid_K)/dT + p(3).*(P-Pmid)/dP + p(4))));
+models(6).lb   = [padmax_lb, -15, -15, -10];
+models(6).ub   = [padmax_ub,  15,  15,  10];
+models(6).x0   = [min(max(PadFrac_ideal*1.3, padmax_lb), padmax_ub), 0, 0, 0];
 
 %% ================== RUN OPTIMIZATION FOR EACH MODEL ==================
 opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 1000, ...
     'FunctionTolerance', 1e-10, 'StepTolerance', 1e-10);
 
-results = struct('name', {}, 'params', {}, 'h_w', {}, 'padfrac_params', {}, ...
+results = struct('name', {}, 'params', {}, 'h_wF', {}, 'h_wR', {}, 'padfrac_params', {}, 'fun', {}, ...
     'rmse_F', {}, 'avg_pct_err', {}, 'sse', {}, 'nresid', {}, 'nparams', {}, 'aicc', {});
 
+% Two fitting strategies are compared for every PadFrac model:
+%   'joint'    - the original approach: h_w and PadFrac are fit together
+%                against the full residual in one lsqnonlin call.
+%   'twostage' - h_w is fit FIRST, using only cooldown-phase residuals
+%                (steps where PadFrac plays no role at all, since no
+%                energy is being added), with PadFrac held at the fixed
+%                physical anchor. h_w is then FROZEN and PadFrac is fit
+%                against the full residual. This breaks the confounding
+%                between the two parameter sets described in the earlier
+%                discussion of why the pressure terms were misbehaving:
+%                in the joint fit, h_w and PadFrac can trade off against
+%                each other to explain the same temperature residual,
+%                which is a major source of the pressure term drifting to
+%                physically implausible values.
+strategies = {'joint', 'twostage'};
+constPadFracFun = @(T, P, p) PadFrac_ideal; %#ok<NASGU> % placeholder for stage 1 (p unused)
+
+idx = 0;
 for m = 1:numel(models)
-    fprintf('\n=== Fitting model %d/%d: %s ===\n', m, numel(models), models(m).name);
+    for s = 1:numel(strategies)
+        strategy = strategies{s};
+        idx = idx + 1;
+        label = sprintf('%s [%s]', models(m).name, strategy);
+        fprintf('\n=== Fitting model %d/%d (%s): %s ===\n', m, numel(models), strategy, models(m).name);
 
-    x0 = [x1_seed, b1_seed, x1_seed, b1_seed, models(m).x0];
-    lb = [x1_lb, b1_lb, x1_lb, b1_lb, models(m).lb];
-    ub = [x1_ub, b1_ub, x1_ub, b1_ub, models(m).ub];
+        if strcmp(strategy, 'joint')
+            x0 = [x1_seed, b1_seed, x1_seed, b1_seed, models(m).x0];
+            lb = [x1_lb, b1_lb, x1_lb, b1_lb, models(m).lb];
+            ub = [x1_ub, b1_ub, x1_ub, b1_ub, models(m).ub];
 
-    resFun = @(p) brake_temp_residuals(p, models(m).fun, datasets, ...
-        VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-        I, WheelR);
+            resFun = @(p) brake_temp_residuals(p, models(m).fun, datasets, ...
+                VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
+                I, WheelR, 'all');
 
-    [p_opt, resnorm, residual] = lsqnonlin(resFun, x0, lb, ub, opts);
+            [p_opt, ~, residual] = lsqnonlin(resFun, x0, lb, ub, opts);
+        else
+            % Stage 1: h_w only, cooldown-phase residual, PadFrac fixed at anchor.
+            x0_hw = [x1_seed, b1_seed, x1_seed, b1_seed];
+            lb_hw = [x1_lb, b1_lb, x1_lb, b1_lb];
+            ub_hw = [x1_ub, b1_ub, x1_ub, b1_ub];
+            resFun_stage1 = @(hw) brake_temp_residuals([hw(:); 0], constPadFracFun, datasets, ...
+                VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
+                I, WheelR, 'cooldown_only');
+            hw_opt = lsqnonlin(resFun_stage1, x0_hw, lb_hw, ub_hw, opts);
 
-    residual = residual(isfinite(residual));
-    nResid   = numel(residual);
-    sse      = sum(residual.^2);
-    rmse     = sqrt(sse / nResid);
-    kParams  = numel(p_opt);
-    % AICc: lower is better; penalizes extra parameters so a model isn't
-    % favored just because it has more knobs to turn.
-    aicc = nResid*log(sse/nResid) + 2*kParams + (2*kParams*(kParams+1)) / max(nResid - kParams - 1, 1);
+            % Stage 2: PadFrac params only, full residual, h_w frozen at Stage-1 result.
+            resFun_stage2 = @(pp) brake_temp_residuals([hw_opt(:); pp(:)], models(m).fun, datasets, ...
+                VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
+                I, WheelR, 'all');
+            [pp_opt, ~, residual] = lsqnonlin(resFun_stage2, models(m).x0, models(m).lb, models(m).ub, opts);
 
-    results(m).name           = models(m).name;
-    results(m).params         = p_opt;
-    results(m).h_wF           = p_opt(1:2);
-    results(m).h_wR           = p_opt(3:4);
-    results(m).padfrac_params = p_opt(5:end);
-    results(m).rmse_F         = rmse;
-    results(m).sse            = sse;
-    results(m).nresid         = nResid;
-    results(m).nparams        = kParams;
-    results(m).aicc           = aicc;
+            p_opt = [hw_opt(:); pp_opt(:)];
+        end
 
-    fprintf('  h_wF:  x1 = %.4f, b1 = %.4f\n', p_opt(1), p_opt(2));
-    fprintf('  h_wR:  x1 = %.4f, b1 = %.4f\n', p_opt(3), p_opt(4));
-    fprintf('  PadFrac params: %s\n', mat2str(p_opt(5:end), 5));
-    fprintf('  RMSE = %.2f degF | AICc = %.1f\n', rmse, aicc);
+        residual = residual(isfinite(residual));
+        nResid   = numel(residual);
+        sse      = sum(residual.^2);
+        rmse     = sqrt(sse / nResid);
+        kParams  = numel(p_opt);
+        % AICc: lower is better; penalizes extra parameters so a model isn't
+        % favored just because it has more knobs to turn.
+        aicc = nResid*log(sse/nResid) + 2*kParams + (2*kParams*(kParams+1)) / max(nResid - kParams - 1, 1);
+
+        results(idx).name           = label;
+        results(idx).params         = p_opt;
+        results(idx).h_wF           = p_opt(1:2);
+        results(idx).h_wR           = p_opt(3:4);
+        results(idx).padfrac_params = p_opt(5:end);
+        results(idx).fun            = models(m).fun;
+        results(idx).rmse_F         = rmse;
+        results(idx).sse            = sse;
+        results(idx).nresid         = nResid;
+        results(idx).nparams        = kParams;
+        results(idx).aicc           = aicc;
+
+        fprintf('  h_wF:  x1 = %.4f, b1 = %.4f\n', p_opt(1), p_opt(2));
+        fprintf('  h_wR:  x1 = %.4f, b1 = %.4f\n', p_opt(3), p_opt(4));
+        fprintf('  PadFrac params: %s\n', mat2str(p_opt(5:end), 5));
+        fprintf('  RMSE = %.2f degF | AICc = %.1f\n', rmse, aicc);
+    end
 end
 
 %% ================== COMPARE MODELS ==================
 fprintf('\n================ MODEL COMPARISON ================\n');
-fprintf('%-38s %8s %8s %8s\n', 'Model', '#params', 'RMSE(F)', 'AICc');
+fprintf('%-58s %8s %8s %8s\n', 'Model [strategy]', '#params', 'RMSE(F)', 'AICc');
 for m = 1:numel(results)
-    fprintf('%-38s %8d %8.2f %8.1f\n', results(m).name, results(m).nparams, results(m).rmse_F, results(m).aicc);
+    fprintf('%-58s %8d %8.2f %8.1f\n', results(m).name, results(m).nparams, results(m).rmse_F, results(m).aicc);
 end
 [~, best_idx] = min([results.aicc]);
 fprintf('\n>>> Recommended model (lowest AICc, balances fit vs. complexity): %s <<<\n', results(best_idx).name);
@@ -291,7 +424,7 @@ fprintf('    If you just want the lowest raw error regardless of overfit risk, c
 
 %% ================== PLOT BEST MODEL: MEASURED VS SIMULATED ==================
 best = results(best_idx);
-best_fun = models(best_idx).fun;
+best_fun = best.fun;
 
 for k = 1:nFiles
     ds = datasets(k);
@@ -322,16 +455,15 @@ fprintf('x1f = %.6f;   %% h_wF slope\n', best.h_wF(1));
 fprintf('b1f = %.6f;   %% h_wF intercept\n', best.h_wF(2));
 fprintf('x1r = %.6f;   %% h_wR slope\n', best.h_wR(1));
 fprintf('b1r = %.6f;   %% h_wR intercept\n', best.h_wR(2));
-fprintf('PadFrac params (%s):\n', models(best_idx).name);
+fprintf('PadFrac params (%s):\n', best.name);
 for i = 1:numel(best.padfrac_params)
     fprintf('  p(%d) = %.8g\n', i, best.padfrac_params(i));
 end
 fprintf('\nNOTE: if the best model has more than 2 PadFrac params (i.e. is not\n');
 fprintf('the plain linear-in-T baseline), you must update the PadFrac formula\n');
-fprintf('inside run_sim (in brake_temp_sim.m) to match models(%d).fun above -\n', best_idx);
+fprintf('inside run_sim (in brake_temp_sim.m) to match the "%s" form above -\n', best.name);
 fprintf('the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the\n');
-fprintf('new pressure-dependent terms.\n');
-fprintf('date and time: %s\n', datetime('now'));
+fprintf('new pressure-dependent or logistic/anchored terms.\n');
 
 %% ================== AGGREGATED PLOTS (Rotor temp in °F, axes start at 0) ==================
 % Creates two figures total combining all parsed datasets.
@@ -555,10 +687,18 @@ end
 
 function residual = brake_temp_residuals(p, padfrac_fun, datasets, ...
     VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-    I, WheelR)
+    I, WheelR, residualMode)
 % Pools front + rear residuals across ALL datasets into one vector for
 % lsqnonlin. x1,b1 (h_w) and the PadFrac params are shared/global across
 % every dataset and both corners - only Tbias flips between front/rear.
+%
+% residualMode: 'all' (default) uses every sample. 'cooldown_only' zeros
+% out residuals from steps that took the active-braking branch, so the
+% objective only reflects passive-cooling behavior - used by the
+% two-stage fit to identify h_w without PadFrac able to compensate for it.
+if nargin < 11
+    residualMode = 'all';
+end
 
 x1f_p = p(1); b1f_p = p(2); x1r_p = p(3); b1r_p = p(4); padfrac_params = p(5:end);
 
@@ -566,30 +706,44 @@ residual = [];
 for k = 1:numel(datasets)
     ds = datasets(k);
 
-    predF_front = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
+    [predF_front, activeFront] = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
         x1f_p, b1f_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
         ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, ds.TambK);
 
-    predF_rear = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
+    [predF_rear, activeRear] = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
         x1r_p, b1r_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
         ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, ds.TambK);
 
-    residual = [residual; predF_front(:) - ds.fr_temp_F(:); predF_rear(:) - ds.rr_temp_F(:)]; %#ok<AGROW>
+    residFront = predF_front(:) - ds.fr_temp_F(:);
+    residRear  = predF_rear(:) - ds.rr_temp_F(:);
+
+    if strcmp(residualMode, 'cooldown_only')
+        residFront(activeFront) = 0;
+        residRear(activeRear)   = 0;
+    end
+
+    residual = [residual; residFront; residRear]; %#ok<AGROW>
 end
 
 residual(~isfinite(residual)) = 0;  % safety net against a rare divergent step
 end
 
 
-function RotorTempArrayF = run_sim_opt(t, velx, BrakePress, brakeTempArray, Tbias, ...
+function [RotorTempArrayF, activeMask] = run_sim_opt(t, velx, BrakePress, brakeTempArray, Tbias, ...
     x1_p, b1_p, padfrac_fun, padfrac_params, total_regen_power, Edrag, ...
     omega_wheel_L, omega_wheel_R, VehicleMass, RotorMass, RotorArea, I, WheelR, TambK) %#ok<INUSD>
 % Same physics as run_sim() in brake_temp_sim.m, except PadFrac is now
 % evaluated by an arbitrary function of (rotor temp [K], applied
 % pressure [psi]) instead of a hardcoded linear-in-T formula.
+%
+% activeMask(i) is true where step i took the active-braking branch (i.e.
+% PadFrac actually mattered for that step) and false where it took the
+% passive-cooling branch. Used to isolate cooldown-only residuals for the
+% two-stage fitting strategy below.
 
 RotorTempArrayK = zeros(size(t));
 RotorTempArrayK(1) = (brakeTempArray(1) - 32) * (5/9) + 273.15;
+activeMask = false(size(t));
 min_pressure = 5;  % psi, threshold to consider brakes applied
 
 for i = 2:length(t)
@@ -613,6 +767,7 @@ for i = 2:length(t)
     end
 
     if DS < 0 && BrakePress(i) > min_pressure
+        activeMask(i) = true;
         Energy1 = 0.5 * VehicleMass * (prevSpeed^2 - newSpeed^2);
         omegaP  = (omega_wheel_L(i-1) + omega_wheel_R(i-1)) / 2;
         omegaN  = (omega_wheel_L(i)   + omega_wheel_R(i))   / 2;
