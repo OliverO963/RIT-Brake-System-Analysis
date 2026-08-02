@@ -1,4 +1,24 @@
 ================ FINAL FIT (best model) ================
+x1f = 1.087479;   % h_wF slope
+b1f = 32.559219;   % h_wF intercept
+x1r = 3.085466;   % h_wR slope
+b1r = 30.688691;   % h_wR intercept
+PadFrac params (Saturating logistic in T,P (bounded, cannot collapse to 0) [joint]):
+  p(1) = 0.58618802
+  p(2) = 2.9645577
+  p(3) = -6.7555347
+  p(4) = 0.48454182
+
+NOTE: if the best model has more than 2 PadFrac params (i.e. is not
+the plain linear-in-T baseline), you must update the PadFrac formula
+inside run_sim (in brake_temp_sim.m) to match the "Saturating logistic in T,P (bounded, cannot collapse to 0) [joint]" form above -
+the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the
+new pressure-dependent or logistic/anchored terms.
+date and time: 02-Aug-2026 00:53:00
+input data: carData\F34preProcessed_split_7-31_manuallySelected
+OK TO USE 
+
+================ FINAL FIT (best model) ================
 x1f = 0.055860;   % h_wF slope
 b1f = 32.025052;   % h_wF intercept
 x1r = 2.682170;   % h_wR slope
