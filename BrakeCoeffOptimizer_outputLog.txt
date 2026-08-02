@@ -1,0 +1,59 @@
+================ FINAL FIT (best model) ================
+x1f = 0.055860;   % h_wF slope
+b1f = 32.025052;   % h_wF intercept
+x1r = 2.682170;   % h_wR slope
+b1r = 28.826248;   % h_wR intercept
+PadFrac params (Quadratic in T, linear in P):
+  p(1) = -0.002440977
+  p(2) = 2.8126283e-06
+  p(3) = -0.00068110755
+  p(4) = 1.2826624
+
+NOTE: if the best model has more than 2 PadFrac params (i.e. is not
+the plain linear-in-T baseline), you must update the PadFrac formula
+inside run_sim (in brake_temp_sim.m) to match models(4).fun above -
+the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the
+new pressure-dependent terms.
+date and time: 02-Aug-2026 00:12:59
+input data: carData\F34preProcessed_split_7-31_manuallySelected
+OK TO USE
+
+================ FINAL FIT (best model) ================
+x1f = 0.000000;   % h_wF slope
+b1f = 36.172888;   % h_wF intercept
+x1r = 2.466405;   % h_wR slope
+b1r = 29.402888;   % h_wR intercept
+PadFrac params (Quadratic in T, linear in P):
+  p(1) = -0.00244187
+  p(2) = 3.5087007e-06
+  p(3) = -0.001124222
+  p(4) = 1.3648459
+
+NOTE: if the best model has more than 2 PadFrac params (i.e. is not
+the plain linear-in-T baseline), you must update the PadFrac formula
+inside run_sim (in brake_temp_sim.m) to match models(4).fun above -
+the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the
+new pressure-dependent terms.
+date and time: 02-Aug-2026 00:07:54
+input data: carData\F34preProcessed_combined_8-1
+BAD DO NOT USE
+
+================ FINAL FIT (best model) ================
+x1f = 0.000000;   % h_wF slope
+b1f = 42.928477;   % h_wF intercept
+x1r = 3.203497;   % h_wR slope
+b1r = 35.334910;   % h_wR intercept
+PadFrac params (Quadratic in T, linear in P):
+  p(1) = -0.0021501056
+  p(2) = 2.3105745e-06
+  p(3) = -0.001124222
+  p(4) = 1.5
+
+NOTE: if the best model has more than 2 PadFrac params (i.e. is not
+the plain linear-in-T baseline), you must update the PadFrac formula
+inside run_sim (in brake_temp_sim.m) to match models(4).fun above -
+the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the
+new pressure-dependent terms.
+date and time: 02-Aug-2026 00:04:40
+input data: carData\F34preProcessed_split_8-1
+BAD DO NOT USE

@@ -331,6 +331,7 @@ fprintf('the plain linear-in-T baseline), you must update the PadFrac formula\n'
 fprintf('inside run_sim (in brake_temp_sim.m) to match models(%d).fun above -\n', best_idx);
 fprintf('the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the\n');
 fprintf('new pressure-dependent terms.\n');
+fprintf('date and time: %s\n', datetime('now'));
 
 %% ================== AGGREGATED PLOTS (Rotor temp in °F, axes start at 0) ==================
 % Creates two figures total combining all parsed datasets.

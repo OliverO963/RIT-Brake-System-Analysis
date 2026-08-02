@@ -427,7 +427,7 @@ cfg.OutputFolderName = "BrakeCoeffOptimizer_Ready";
 
 % Export all retained driving portions from each session into one file.
 % Set this false to return to one file per detected segment.
-cfg.CombineSegmentsIntoOneFile = false;
+cfg.CombineSegmentsIntoOneFile = true;
 
 % When true, skip temperature-startup cleaning, spike filtering, and
 % segment detection entirely - just reformat each session's full time
