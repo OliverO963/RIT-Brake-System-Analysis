@@ -786,10 +786,25 @@ end
 
 
 function driveType = detectDriveType(fname)
-% Reads the first several lines of a data file looking for the
-% "# Segment type: <kind>" header F34BrakeDataPreprocessor.m writes, and
-% maps it to a coarse drive-type category. Falls back to a prompt for
-% files without a recognizable header (e.g. raw/non-preprocessed input).
+% Primary signal: the FILENAME itself. Checked first because
+% RawFormatOnly exports from F34BrakeDataPreprocessor.m always write
+% "Segment type: raw_format_only" in their header regardless of the
+% file's true drive type - the header can't distinguish an endurance
+% rawformat file from an autocross one, but the filename usually can.
+[~, baseName, ~] = fileparts(fname);
+lowerName = lower(baseName);
+if ~isempty(strfind(lowerName, 'endurance'))
+    driveType = 'Endurance';
+    return
+end
+if ~isempty(strfind(lowerName, 'autocross')) || ~isempty(strfind(lowerName, 'autox'))
+    driveType = 'Autocross';
+    return
+end
+
+% Fallback: the "# Segment type: <kind>" header, for files whose name
+% doesn't happen to contain a recognizable keyword but WERE preprocessed
+% normally (not RawFormatOnly).
 driveType = '';
 fid = fopen(fname, 'r');
 if fid >= 0
@@ -829,6 +844,7 @@ end
 end
 
 
+
 function plotFadeHeatmap(flux, tempF, muRatio, titleStr)
 % Same griddata + contourf + imgaussfilt heatmap style used for the
 % throttle/steer/yaw heatmaps, applied to mu_ratio vs (flux, temperature)
@@ -847,7 +863,7 @@ temp_grid = linspace(min(tempF), max(tempF), 50);
 [F_grid, T_grid] = meshgrid(flux_grid, temp_grid);
 
 Z_grid = griddata(flux, tempF, muRatio, F_grid, T_grid, 'linear');
-Z_grid = imgaussfilt(Z_grid, 1.5, 'FillValues', NaN);
+Z_grid = imgaussfilt(Z_grid, 1.5);
 
 contourf(F_grid, T_grid, Z_grid, 20, 'LineColor', 'none');
 hold on;
