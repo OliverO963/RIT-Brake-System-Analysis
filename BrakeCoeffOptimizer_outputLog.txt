@@ -4,6 +4,8 @@ b1f = 32.559219;   % h_wF intercept
 x1r = 3.085466;   % h_wR slope
 b1r = 30.688691;   % h_wR intercept
 PadFrac params (Saturating logistic in T,P (bounded, cannot collapse to 0) [joint]):
+@(T, P) p(1) ./ (1 + exp(-(p(2).*(T-Tmid_K)/dT + p(3).*(P-Pmid)/dP + p(4))));
+
   p(1) = 0.58618802
   p(2) = 2.9645577
   p(3) = -6.7555347
@@ -24,6 +26,8 @@ b1f = 32.025052;   % h_wF intercept
 x1r = 2.682170;   % h_wR slope
 b1r = 28.826248;   % h_wR intercept
 PadFrac params (Quadratic in T, linear in P):
+@(T, P) p(1).*T + p(2).*T.^2 + p(3).*P + p(4);
+
   p(1) = -0.002440977
   p(2) = 2.8126283e-06
   p(3) = -0.00068110755
