@@ -451,10 +451,12 @@ end
 
 %% ================== FINAL COEFFICIENTS ==================
 fprintf('\n================ FINAL FIT (best model) ================\n');
+fprintf('Date and time %s\n', datetime);
 fprintf('x1f = %.6f;   %% h_wF slope\n', best.h_wF(1));
 fprintf('b1f = %.6f;   %% h_wF intercept\n', best.h_wF(2));
 fprintf('x1r = %.6f;   %% h_wR slope\n', best.h_wR(1));
 fprintf('b1r = %.6f;   %% h_wR intercept\n', best.h_wR(2));
+fprintf('padFrac function: %s\n', func2str(best_fun));
 fprintf('PadFrac params (%s):\n', best.name);
 for i = 1:numel(best.padfrac_params)
     fprintf('  p(%d) = %.8g\n', i, best.padfrac_params(i));
