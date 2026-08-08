@@ -42,6 +42,7 @@
 % ================================================================
 
 clc; clear; close all
+cfg.SkipTimeCropPrompt = true;
 
 %% ================== CALIBRATED MODEL CONSTANTS ==================
 % >>> Replace these with your finalized fit from BrakeCoeffOptimizer.m <<<
@@ -215,14 +216,19 @@ for k = 1:nFiles
     fprintf('  Detected format: %s (%d columns)\n', fmt, ncols);
 
     t_full = raw(:, 1);
-    prompt = {sprintf('Start time (s)  [data range %.1f - %.1f]:', t_full(1), t_full(end)), 'End time (s):'};
-    defaultAns = {num2str(t_full(1)), num2str(t_full(end))};
-    answer = inputdlg(prompt, sprintf('Time crop: %s', files{k}), 1, defaultAns);
-    if isempty(answer)
-        t_start_k = t_full(1); t_end_k = t_full(end);
+    if cfg.SkipTimeCropPrompt
+        t_start_k = t_full(1);
+        t_end_k   = t_full(end);
     else
-        t_start_k = str2double(answer{1});
-        t_end_k   = str2double(answer{2});
+        prompt = {sprintf('Start time (s)  [data range %.1f - %.1f]:', t_full(1), t_full(end)), 'End time (s):'};
+        defaultAns = {num2str(t_full(1)), num2str(t_full(end))};
+        answer = inputdlg(prompt, sprintf('Time crop: %s', files{k}), 1, defaultAns);
+        if isempty(answer)
+            t_start_k = t_full(1); t_end_k = t_full(end);
+        else
+            t_start_k = str2double(answer{1});
+            t_end_k   = str2double(answer{2});
+        end
     end
     raw = raw(t_full >= t_start_k & t_full <= t_end_k, :);
     if size(raw, 1) < 3
@@ -871,12 +877,39 @@ end
 function plotFadeHeatmap(flux, tempF, muRatio, titleStr)
 % 3D surface + scatter3, matching the visual style of BrakeCoeffOptimizer.m's
 % "PadFrac vs Temperature(F) and Pressure" plot (surf + scatter3 + colorbar +
-% fixed view angle) applied to mu_ratio vs (flux, temperature). Values are
-% plotted exactly as computed - no clamping - so this remains a true
-% diagnostic of the underlying mu_ratio computation, not a cosmetically
-% smoothed view of it.
+% fixed view angle) applied to mu_ratio vs (flux, temperature).
+%
+% Upper-tail outliers (Tukey IQR "extreme outlier" fence: > Q3 + 3*(Q3-Q1),
+% computed from THIS panel's own mu_ratio values) are omitted from the plot
+% so a handful of extreme single-sample spikes don't dominate the surface/
+% color scale. The 3x (not the more common 1.5x "mild outlier") multiplier
+% is deliberate: mu_ratio's distribution is heavily right-skewed with most
+% mass compressed between 0 and ~1, so the 1.5x fence flags 6-9% of ALL
+% samples - including the entire physically-meaningful 0.85-1.2 range right
+% around the fade threshold - not just genuine spikes. 3x targets only the
+% true outliers. Only the upper tail is ever filtered - low mu_ratio is
+% genuine fade signal, never noise, so it's never excluded. This filtering
+% is local to the plot only; it does NOT touch the fade_samples_*/
+% analyzeFadeOnset data used by Output 5/7. The omitted count is reported
+% both to the console and in the subplot title so the omission itself
+% stays visible.
 valid = isfinite(flux) & isfinite(tempF) & isfinite(muRatio);
 flux = flux(valid); tempF = tempF(valid); muRatio = muRatio(valid);
+nTotal = numel(muRatio);
+
+if nTotal >= 4
+    q = quantile(muRatio, [0.25, 0.75]);
+    upperFence = q(2) + 3 * (q(2) - q(1));
+    isOutlier = muRatio > upperFence;
+else
+    isOutlier = false(size(muRatio));
+    upperFence = Inf;
+end
+nOutliers = sum(isOutlier);
+fprintf('  %s: omitted %d/%d outlier point(s) (mu_ratio > %.3f)\n', titleStr, nOutliers, nTotal, upperFence);
+
+flux = flux(~isOutlier); tempF = tempF(~isOutlier); muRatio = muRatio(~isOutlier);
+titleStr = sprintf('%s (%d/%d omitted)', titleStr, nOutliers, nTotal);
 
 if numel(flux) < 10 || range(flux) <= 0 || range(tempF) <= 0
     title([titleStr ' (insufficient data)']);
