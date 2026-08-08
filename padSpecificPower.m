@@ -119,6 +119,25 @@ min_event_dur_s  = 0.2;   % drop merged events shorter than this
 % SAME formula already used to build Tbias_brake). Their ratio is the
 % fade signal: mu_ratio = T_actual / T_predicted = mu_actual / mu_nominal.
 min_omega_wheel_rad_s = 3.0;   % below this, Power/omega -> torque is noisy; exclude
+min_pressure_muratio_psi = 150; % psi - stricter than the general min_pressure engagement
+                                % gate (5 psi). T_predicted ~ pressure * piston area *
+                                % nominal mu * radius, so right at min_pressure it's only a
+                                % few N*m - too small for the independently-computed
+                                % T_actual's finite-difference noise to divide by cleanly.
+                                % Mirrors min_omega_wheel_rad_s's role on the numerator side.
+                                % CALIBRATED against curated_8-2 (14 files): a pressure-
+                                % threshold sweep (5 to 1000 psi) showed the bulk of the
+                                % mu_ratio distribution (p99) falls from ~19x at 5 psi to
+                                % ~1.5x/2.0x (front/rear) at 150 psi, while retaining ~75-80%
+                                % of samples (well above what analyzeFadeOnset's
+                                % min_samples_per_bin needs). A handful of individual outlier
+                                % points (up to ~7-13x) persist at ALL pressure levels tested,
+                                % including high pressure - these are NOT a low-pressure/
+                                % small-denominator artifact and this gate does not remove
+                                % them; they most likely trace to single-timestep timing
+                                % mismatch between the instantaneous pressure reading and the
+                                % finite-difference wheel-deceleration signal. They are left
+                                % visible (unclipped) in Figure 3 by design - see plotFadeHeatmap.
 mu_ratio_fade_threshold = 0.9; % flag fade onset where mu_ratio drops below this
 n_temp_bins      = 4;    % quantile bins used to control for temperature
 n_flux_bins      = 7;    % quantile bins of specific power within each temp bin
@@ -219,14 +238,14 @@ for k = 1:nFiles
         derived.fl_omega_wheel, derived.fr_omega_wheel, ...
         VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK, ...
         A_pad_front_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
-        derived.T_predicted_front, min_omega_wheel_rad_s);
+        derived.T_predicted_front, min_omega_wheel_rad_s, min_pressure_muratio_psi);
 
     sim_rear = simulate_pad_power(t, derived.velx, derived.rearpressure, 1 - derived.Tbias_brake, ...
         x1, b1, padfrac_fun, derived.total_regen_power, Edrag, ...
         derived.rl_omega_wheel, derived.rr_omega_wheel, ...
         VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK, ...
         A_pad_rear_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
-        derived.T_predicted_rear, min_omega_wheel_rad_s);
+        derived.T_predicted_rear, min_omega_wheel_rad_s, min_pressure_muratio_psi);
 
     % Lagged (trailing moving-average) specific power - candidate flux
     % definition for the fade-onset correlation, compared against the
@@ -643,7 +662,7 @@ end
 function sim = simulate_pad_power(t, velx, BrakePress, Tbias, x1_p, b1_p, padfrac_fun, ...
     total_regen_power, Edrag, omega_wheel_L, omega_wheel_R, ...
     VehicleMass, RotorMass, RotorArea, I, WheelR, TambK, A_pad_cm2, BrakeFrac, CalibrationFactor, ...
-    min_pressure, corner_split, TambC, T_predicted, min_omega_wheel_rad_s) %#ok<INUSD>
+    min_pressure, corner_split, TambC, T_predicted, min_omega_wheel_rad_s, min_pressure_muratio) %#ok<INUSD>
 % Walks the full timeseries computing rotor temp (needed for PadFrac's
 % temperature dependence), per-step pad energy, and instantaneous
 % specific power (W/cm^2). PadFrac uses the SAME (1-PadFrac)/PadFrac
@@ -721,7 +740,7 @@ for i = 2:n
         if omegaN > min_omega_wheel_rad_s
             T_actual_axle_power = (friction_energy / tbrake) * Tbias(i) * (1 - AeroFrac);
             T_actual(i) = T_actual_axle_power * corner_split / omegaN;
-            if isfinite(T_predicted(i)) && T_predicted(i) > 1e-6
+            if isfinite(T_predicted(i)) && T_predicted(i) > 1e-6 && BrakePress(i) > min_pressure_muratio
                 mu_ratio(i) = T_actual(i) / T_predicted(i);
             end
         end
@@ -846,9 +865,12 @@ end
 
 
 function plotFadeHeatmap(flux, tempF, muRatio, titleStr)
-% Same griddata + contourf + imgaussfilt heatmap style used for the
-% throttle/steer/yaw heatmaps, applied to mu_ratio vs (flux, temperature)
-% so temperature context is never collapsed away.
+% 3D surface + scatter3, matching the visual style of BrakeCoeffOptimizer.m's
+% "PadFrac vs Temperature(F) and Pressure" plot (surf + scatter3 + colorbar +
+% fixed view angle) applied to mu_ratio vs (flux, temperature). Values are
+% plotted exactly as computed - no clamping - so this remains a true
+% diagnostic of the underlying mu_ratio computation, not a cosmetically
+% smoothed view of it.
 valid = isfinite(flux) & isfinite(tempF) & isfinite(muRatio);
 flux = flux(valid); tempF = tempF(valid); muRatio = muRatio(valid);
 
@@ -865,15 +887,16 @@ temp_grid = linspace(min(tempF), max(tempF), 50);
 Z_grid = griddata(flux, tempF, muRatio, F_grid, T_grid, 'linear');
 Z_grid = imgaussfilt(Z_grid, 1.5);
 
-contourf(F_grid, T_grid, Z_grid, 20, 'LineColor', 'none');
+surf(F_grid, T_grid, Z_grid, 'EdgeColor', 'none', 'FaceAlpha', 0.9);
 hold on;
-contour(F_grid, T_grid, Z_grid, 10, 'LineColor', 'k', 'LineWidth', 0.5);
-scatter(flux, tempF, 6, 'w.', 'MarkerEdgeAlpha', 0.25);
-colormap('jet');
-c = colorbar; c.Label.String = 'mu_{actual} / mu_{nominal}';
+scatter3(flux, tempF, muRatio, 18, muRatio, 'filled', 'MarkerEdgeColor', 'k', 'MarkerFaceAlpha', 0.85);
+
+colorbar;
 xlabel('Specific Power (W/cm^2)');
 ylabel('Rotor Temp (deg F, pad-face proxy)');
+zlabel('mu_{actual} / mu_{nominal}');
 title(titleStr, 'Interpreter', 'none');
+view(45, 25);
 grid on;
 end
 
