@@ -81,3 +81,83 @@ new pressure-dependent terms.
 date and time: 02-Aug-2026 00:04:40
 input data: carData\F34preProcessed_split_8-1
 BAD DO NOT USE
+
+================ FINAL FIT (best model) ================
+Date and time 08-Aug-2026 00:00:24
+x1f = 2.652365;   % h_wF slope
+b1f = 20.523613;   % h_wF intercept
+x1r = 3.976445;   % h_wR slope
+b1r = 31.498280;   % h_wR intercept
+padFrac function: @(T,P,p)p(1).*T+p(2)
+PadFrac params (Linear in T only (current baseline) [joint]):
+  p(1) = 0.00032746399
+  p(2) = 0.18904768
+input data: carData\curated_8-2 (14 files)
+
+================ FINAL FIT (best model) ================
+Date and time 08-Aug-2026 00:01:04
+x1f = 2.652364;   % h_wF slope
+b1f = 20.523599;   % h_wF intercept
+x1r = 3.976444;   % h_wR slope
+b1r = 31.498294;   % h_wR intercept
+padFrac function: @(T,P,p)p(1).*T+p(2).*P+p(3)
+PadFrac params (Linear, independent T and P [joint]):
+  p(1) = 0.00032746604
+  p(2) = 2.337321e-14
+  p(3) = 0.18904668
+input data: carData\curated_8-2 (14 files)
+
+================ FINAL FIT (best model) ================
+Date and time 08-Aug-2026 00:01:54
+x1f = 0.481861;   % h_wF slope
+b1f = 23.217170;   % h_wF intercept
+x1r = 1.985525;   % h_wR slope
+b1r = 32.498980;   % h_wR intercept
+padFrac function: @(T,P,p)p(1).*T+p(2).*P+p(3).*T.*P+p(4)
+PadFrac params (Linear with T*P interaction [joint]):
+  p(1) = 0.0014134517
+  p(2) = 3.75409e-14
+  p(3) = -9.1902347e-07
+  p(4) = -0.004423408
+input data: carData\curated_8-2 (14 files)
+
+================ FINAL FIT (best model) ================
+Date and time 08-Aug-2026 00:02:27
+x1f = 2.725872;   % h_wF slope
+b1f = 20.842806;   % h_wF intercept
+x1r = 4.245275;   % h_wR slope
+b1r = 28.887733;   % h_wR intercept
+padFrac function: @(T,P,p)p(1).*T+p(2).*T.^2+p(3).*P+p(4)
+PadFrac params (Quadratic in T, linear in P [joint]):
+  p(1) = -0.0023689048
+  p(2) = 2.2448482e-06
+  p(3) = 4.1746139e-14
+  p(4) = 0.95659049
+input data: carData\curated_8-2 (14 files)
+
+================ FINAL FIT (best model) ================
+Date and time 08-Aug-2026 00:02:55
+x1f = 3.814704;   % h_wF slope
+b1f = 21.979610;   % h_wF intercept
+x1r = 5.204694;   % h_wR slope
+b1r = 31.916136;   % h_wR intercept
+padFrac function: @(T,P,p)PadFrac_ideal+p(1).*(T-Tmid_K)/dT+p(2).*(P-Pmid)/dP+p(3)
+PadFrac params (Anchored to effusivity-based ideal (small T,P correction) [joint]):
+  p(1) = 0.063648258
+  p(2) = -0.15
+  p(3) = 0.05
+input data: carData\curated_8-2 (14 files)
+
+================ FINAL FIT (best model) ================
+Date and time 08-Aug-2026 00:03:47
+x1f = 1.739543;   % h_wF slope
+b1f = 22.703051;   % h_wF intercept
+x1r = 2.800998;   % h_wR slope
+b1r = 31.999906;   % h_wR intercept
+padFrac function: @(T,P,p)p(1)./(1+exp(-(p(2).*(T-Tmid_K)/dT+p(3).*(P-Pmid)/dP+p(4))))
+PadFrac params (Saturating logistic in T,P (bounded, cannot collapse to 0) [joint]):
+  p(1) = 0.58618802
+  p(2) = 3.6032465
+  p(3) = -5.2487399
+  p(4) = 0.44358205
+input data: carData\curated_8-2 (14 files)
