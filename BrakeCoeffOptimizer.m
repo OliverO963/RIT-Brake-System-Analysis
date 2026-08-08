@@ -451,19 +451,16 @@ end
 
 %% ================== FINAL COEFFICIENTS ==================
 fprintf('\n================ FINAL FIT (best model) ================\n');
+fprintf('Date and time %s\n', datetime);
 fprintf('x1f = %.6f;   %% h_wF slope\n', best.h_wF(1));
 fprintf('b1f = %.6f;   %% h_wF intercept\n', best.h_wF(2));
 fprintf('x1r = %.6f;   %% h_wR slope\n', best.h_wR(1));
 fprintf('b1r = %.6f;   %% h_wR intercept\n', best.h_wR(2));
+fprintf('padFrac function: %s\n', func2str(best_fun));
 fprintf('PadFrac params (%s):\n', best.name);
 for i = 1:numel(best.padfrac_params)
     fprintf('  p(%d) = %.8g\n', i, best.padfrac_params(i));
 end
-fprintf('\nNOTE: if the best model has more than 2 PadFrac params (i.e. is not\n');
-fprintf('the plain linear-in-T baseline), you must update the PadFrac formula\n');
-fprintf('inside run_sim (in brake_temp_sim.m) to match the "%s" form above -\n', best.name);
-fprintf('the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the\n');
-fprintf('new pressure-dependent or logistic/anchored terms.\n');
 
 %% ================== AGGREGATED PLOTS (Rotor temp in °F, axes start at 0) ==================
 % Creates two figures total combining all parsed datasets.
