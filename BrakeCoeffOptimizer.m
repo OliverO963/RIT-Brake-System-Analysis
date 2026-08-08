@@ -461,11 +461,6 @@ fprintf('PadFrac params (%s):\n', best.name);
 for i = 1:numel(best.padfrac_params)
     fprintf('  p(%d) = %.8g\n', i, best.padfrac_params(i));
 end
-fprintf('\nNOTE: if the best model has more than 2 PadFrac params (i.e. is not\n');
-fprintf('the plain linear-in-T baseline), you must update the PadFrac formula\n');
-fprintf('inside run_sim (in brake_temp_sim.m) to match the "%s" form above -\n', best.name);
-fprintf('the old hardcoded "PadFrac = prevTemp*x2 + b2" line will not use the\n');
-fprintf('new pressure-dependent or logistic/anchored terms.\n');
 
 %% ================== AGGREGATED PLOTS (Rotor temp in °F, axes start at 0) ==================
 % Creates two figures total combining all parsed datasets.
