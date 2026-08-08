@@ -47,15 +47,19 @@ clc; clear; close all
 % >>> Replace these with your finalized fit from BrakeCoeffOptimizer.m <<<
 
 % Rotor cooling coefficient: h_w(v) = x1*v + b1   [W/m^2-K]
-x1 = 2.0006;
-b1 = 40.7137;
+% Separate front/rear pairs, matching BrakeCoeffOptimizer.m's fit (which
+% fits h_wF and h_wR independently - see its FINAL FIT output).
+% From BrakeCoeffOptimizer_outputLog.txt, FINAL FIT dated 08-Aug-2026
+% 00:00:24, input data carData\curated_8-2 (14 files).
+x1f = 2.652365;
+b1f = 20.523613;
+x1r = 3.976445;
+b1r = 31.498280;
 
 % Pad energy fraction: PadFrac = f(T_rotor [K], P_applied [psi])
-% Default below matches the "linear in T only" baseline model.
-% If you settled on a pressure-dependent model instead, edit padfrac_fun
-% and the coefficients to match (see commented examples).
-x2 = 0.001005;    % 1/K
-b2 = -0.5385;      % intercept
+% Model: Linear in T only (current baseline) [joint], same source log entry.
+x2 = 0.00032746399;    % 1/K
+b2 = 0.18904768;      % intercept
 padfrac_fun = @(T, P) x2.*T + b2;
 
 % --- Example alternates (uncomment + set coefficients as needed) ---
@@ -234,14 +238,14 @@ for k = 1:nFiles
 
     %% ---- Run the full-timeseries simulation (front & rear) ----
     sim_front = simulate_pad_power(t, derived.velx, derived.frontpressure, derived.Tbias_brake, ...
-        x1, b1, padfrac_fun, derived.total_regen_power, Edrag, ...
+        x1f, b1f, padfrac_fun, derived.total_regen_power, Edrag, ...
         derived.fl_omega_wheel, derived.fr_omega_wheel, ...
         VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK, ...
         A_pad_front_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
         derived.T_predicted_front, min_omega_wheel_rad_s, min_pressure_muratio_psi);
 
     sim_rear = simulate_pad_power(t, derived.velx, derived.rearpressure, 1 - derived.Tbias_brake, ...
-        x1, b1, padfrac_fun, derived.total_regen_power, Edrag, ...
+        x1r, b1r, padfrac_fun, derived.total_regen_power, Edrag, ...
         derived.rl_omega_wheel, derived.rr_omega_wheel, ...
         VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK, ...
         A_pad_rear_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
