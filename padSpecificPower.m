@@ -2,9 +2,8 @@
 %  Brake Pad Specific Power (Heat Flux) & Fade-Onset Analysis
 % ================================================================
 %  Uses FIXED, already-calibrated rotor cooling and pad-fraction
-%  coefficients (set as constants below - see "CALIBRATED MODEL
-%  CONSTANTS") to walk one or more driving datasets and compute, for
-%  every identified braking event:
+%  coefficients (see "PADFRAC MODEL DEFINITIONS" below) to walk one or
+%  more driving datasets and compute, for every identified braking event:
 %
 %     q'' * A_pad = (K_Linear + K_rot - D_aero) / t_decel   [applied per-pad]
 %
@@ -22,7 +21,13 @@
 %  specific power and temperature to find where the pads start
 %  measurably underperforming their nominal friction coefficient.
 %
-%  Outputs:
+%  Supports evaluating MULTIPLE padFrac models in one run (see
+%  "PADFRAC MODEL DEFINITIONS") - every output below is generated once
+%  per model, plus a final cross-model summary figure comparing specific
+%  power results across models, to show how much the choice of padFrac
+%  model actually impacts the results.
+%
+%  Outputs (generated once per padFrac model):
 %    1) Specific power (W/cm^2) vs. time-since-event-start, for every
 %       braking event found, front and rear pads plotted separately.
 %    2) The average specific power across all events (front & rear).
@@ -31,11 +36,17 @@
 %    4) Heatmaps of mu_actual/mu_nominal vs. specific power and
 %       temperature, for both instantaneous and lagged flux.
 %    5) The empirically-derived fade-onset specific power, front/rear.
-%    6) Average specific power broken out by drive type (endurance,
-%       autocross, other/misc), auto-detected from preprocessed file
-%       headers where available.
-%    7) A regen-braking-failure worst-case margin check: back-calculates
+%    6) Probability distributions of average specific power by drive
+%       type (endurance, autocross, other/misc), front/rear overlaid,
+%       with a table identifying each distribution's best-fit type and
+%       summary statistics.
+%    7) Scatter plots correlating specific power against deceleration
+%       rate, starting speed, regen percentage, event duration, and
+%       rotor temperature at event start.
+%    8) A regen-braking-failure worst-case margin check: back-calculates
 %       the pad area needed to stay under the fade-onset flux.
+%  Plus, after all models are evaluated: a cross-model comparison figure
+%  (box-and-whisker + overlaid distributions of specific power per model).
 %
 %  Datasets are selected via a multi-select file picker, same
 %  21/22/27-column auto-detected formats as BrakeDataAnalysis.m.
@@ -43,35 +54,6 @@
 
 clc; clear; close all
 cfg.SkipTimeCropPrompt = true;
-
-%% ================== CALIBRATED MODEL CONSTANTS ==================
-% >>> Replace these with your finalized fit from BrakeCoeffOptimizer.m <<<
-
-% Rotor cooling coefficient: h_w(v) = x1*v + b1   [W/m^2-K]
-% Separate front/rear pairs, matching BrakeCoeffOptimizer.m's fit (which
-% fits h_wF and h_wR independently - see its FINAL FIT output).
-% From BrakeCoeffOptimizer_outputLog.txt, FINAL FIT dated 08-Aug-2026
-% 00:00:24, input data carData\curated_8-2 (14 files).
-x1f = 2.652365;
-b1f = 20.523613;
-x1r = 3.976445;
-b1r = 31.498280;
-
-% Pad energy fraction: PadFrac = f(T_rotor [K], P_applied [psi])
-% Model: Linear in T only (current baseline) [joint], same source log entry.
-x2 = 0.00032746399;    % 1/K
-b2 = 0.18904768;      % intercept
-padfrac_fun = @(T, P) x2.*T + b2;
-
-% --- Example alternates (uncomment + set coefficients as needed) ---
-% x2 = ...; x3 = ...; b2 = ...;
-% padfrac_fun = @(T, P) x2.*T + x3.*P + b2;                  % linear, indep. T & P
-%
-% x2 = ...; x3 = ...; x4 = ...; b2 = ...;
-% padfrac_fun = @(T, P) x2.*T + x3.*P + x4.*T.*P + b2;       % T*P interaction
-%
-% x2 = ...; x2q = ...; x3 = ...; b2 = ...;
-% padfrac_fun = @(T, P) x2.*T + x2q.*T.^2 + x3.*P + b2;      % quadratic in T
 
 %% ================== VEHICLE / BRAKE CONSTANTS ==================
 VehicleMass     = 259;      % kg
@@ -104,6 +86,11 @@ aero_closed_a =  0.136247;    aero_closed_b =  2.53449;    aero_closed_c = -67.4
 
 velx_threshold = 34;  % m/s, cleaning threshold
 min_pressure   = 5;   % psi, threshold to consider a corner's brake engaged
+
+% NOTE: the calibrated padFrac model(s) - cooling coefficients and
+% PadFrac(T,P) formula(s) - are defined further below, in "PADFRAC MODEL
+% DEFINITIONS", after the datasets are loaded (two of the default models
+% need data-driven normalization constants computed from the loaded data).
 
 %% ================== EVENT-DETECTION SETTINGS ==================
 % A vehicle-level "braking event" = (frontpressure>min_pressure OR
@@ -183,18 +170,16 @@ gearParams = struct('gear_ratio', gear_ratio, 'velx_threshold', velx_threshold);
 
 TambK = TambC + 273.15;
 
-% Pooled event records across all datasets
-events_front = struct('dataset', {}, 't_rel', {}, 'q_inst', {}, 'avg_q', {}, 't_decel', {}, 'driveType', {});
-events_rear  = struct('dataset', {}, 't_rel', {}, 'q_inst', {}, 'avg_q', {}, 't_decel', {}, 'driveType', {});
+%% ================== LOAD & CACHE PER-FILE DATA (model-independent) ==================
+% File I/O, parsing, derived-quantity computation, drive-type detection,
+% and braking-event identification all depend only on the raw telemetry
+% and vehicle/event-detection constants above - NOT on which padFrac
+% model is being evaluated. So this all runs ONCE here, cached into
+% `datasets`, regardless of how many padFrac models are evaluated below
+% (only the simulation itself, which does depend on padFrac, is repeated
+% per model in the loop further down).
+datasets = struct('name', {}, 't', {}, 'derived', {}, 'Edrag', {}, 'driveType', {}, 'event_ranges', {});
 
-% Pooled per-SAMPLE fade-analysis data (finer than per-event averages -
-% every active-braking, omega-gated sample across every event/dataset).
-% Columns: [q_inst, q_lag, T_rotor_F, mu_ratio]
-fade_samples_front = zeros(0, 4);
-fade_samples_rear  = zeros(0, 4);
-
-% Running accumulators used as defaults for the regen-failure assumptions
-% (max speed observed, and mean Tbias_brake across all loaded data).
 maxSpeedSeen = 0;
 sumTbias = 0; countTbias = 0;
 
@@ -239,34 +224,6 @@ for k = 1:nFiles
     parsed  = parse_dataset_columns(raw, fmt);
     derived = compute_derived_quantities(parsed, gearParams, aeroParams);
     Edrag   = compute_edrag(parsed.t, derived.velx, derived.F_aero);
-
-    t = parsed.t;
-
-    %% ---- Run the full-timeseries simulation (front & rear) ----
-    sim_front = simulate_pad_power(t, derived.velx, derived.frontpressure, derived.Tbias_brake, ...
-        x1f, b1f, padfrac_fun, derived.total_regen_power, Edrag, ...
-        derived.fl_omega_wheel, derived.fr_omega_wheel, ...
-        VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK, ...
-        A_pad_front_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
-        derived.T_predicted_front, min_omega_wheel_rad_s, min_pressure_muratio_psi);
-
-    sim_rear = simulate_pad_power(t, derived.velx, derived.rearpressure, 1 - derived.Tbias_brake, ...
-        x1r, b1r, padfrac_fun, derived.total_regen_power, Edrag, ...
-        derived.rl_omega_wheel, derived.rr_omega_wheel, ...
-        VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK, ...
-        A_pad_rear_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
-        derived.T_predicted_rear, min_omega_wheel_rad_s, min_pressure_muratio_psi);
-
-    % Lagged (trailing moving-average) specific power - candidate flux
-    % definition for the fade-onset correlation, compared against the
-    % instantaneous q_inst since surface-layer formation isn't
-    % necessarily instantaneous.
-    dt_ds = median(diff(t), 'omitnan');
-    lag_window_samples = max(1, round(lagged_flux_window_s / max(dt_ds, eps)));
-    q_lag_front = movmean(sim_front.q_inst, [lag_window_samples-1, 0]);
-    q_lag_rear  = movmean(sim_rear.q_inst,  [lag_window_samples-1, 0]);
-
-    %% ---- Determine this dataset's drive type (endurance/autocross/other) ----
     driveType = detectDriveType(fname);
     fprintf('  Drive type: %s\n', driveType);
 
@@ -275,249 +232,149 @@ for k = 1:nFiles
     sumTbias = sumTbias + sum(validTbias);
     countTbias = countTbias + numel(validTbias);
 
-    %% ---- Identify vehicle-level braking events ----
+    % Vehicle-level braking-event ranges - identical across every padFrac
+    % model (depends only on pressure/velocity, not PadFrac), so computed
+    % once here rather than redundantly once per model.
     DS = [0; diff(derived.velx)];
     DS(DS < -2.5) = 0;  % matches the >2.5g exclusion used in the sim
     active = (derived.frontpressure > min_pressure | derived.rearpressure > min_pressure) & (DS < 0);
-
-    event_ranges = find_events(active, t, bridge_gap_s, min_event_dur_s);
+    event_ranges = find_events(active, parsed.t, bridge_gap_s, min_event_dur_s);
     fprintf('  Found %d braking event(s).\n', size(event_ranges, 1));
 
-    for e = 1:size(event_ranges, 1)
-        i0 = event_ranges(e, 1);
-        i1 = event_ranges(e, 2);
-        t_decel = t(i1) - t(i0);
-        if t_decel <= 0
-            continue
-        end
-        idx = (i0+1):i1;   % energies are defined on steps 2:end
-
-        t_rel_f = t(idx) - t(i0);
-        q_inst_f = sim_front.q_inst(idx);
-        total_E_f = sum(sim_front.pad_energy(idx));
-        avg_q_f = total_E_f / t_decel / A_pad_front_cm2;
-
-        t_rel_r = t(idx) - t(i0);
-        q_inst_r = sim_rear.q_inst(idx);
-        total_E_r = sum(sim_rear.pad_energy(idx));
-        avg_q_r = total_E_r / t_decel / A_pad_rear_cm2;
-
-        events_front(end+1) = struct('dataset', files{k}, 't_rel', t_rel_f, ...
-            'q_inst', q_inst_f, 'avg_q', avg_q_f, 't_decel', t_decel, 'driveType', driveType); %#ok<SAGROW>
-        events_rear(end+1) = struct('dataset', files{k}, 't_rel', t_rel_r, ...
-            'q_inst', q_inst_r, 'avg_q', avg_q_r, 't_decel', t_decel, 'driveType', driveType); %#ok<SAGROW>
-
-        % Pool per-sample fade-analysis data. NaN entries (gated out by
-        % the omega/pressure thresholds inside simulate_pad_power) are
-        % dropped here rather than propagated into the binning step.
-        mu_f = sim_front.mu_ratio(idx);
-        keep_f = isfinite(mu_f);
-        fade_samples_front = [fade_samples_front; ...
-            q_inst_f(keep_f), q_lag_front(idx(keep_f)), derived.fr_temp_F(idx(keep_f)), mu_f(keep_f)]; %#ok<AGROW>
-
-        mu_r = sim_rear.mu_ratio(idx);
-        keep_r = isfinite(mu_r);
-        fade_samples_rear = [fade_samples_rear; ...
-            q_inst_r(keep_r), q_lag_rear(idx(keep_r)), derived.rr_temp_F(idx(keep_r)), mu_r(keep_r)]; %#ok<AGROW>
-    end
+    datasets(end+1) = struct('name', files{k}, 't', parsed.t, 'derived', derived, ...
+        'Edrag', Edrag, 'driveType', driveType, 'event_ranges', event_ranges); %#ok<SAGROW>
 end
 
-nEvents = numel(events_front);
-if nEvents == 0
-    error('No braking events found across the selected dataset(s).');
+if isempty(datasets)
+    error('No usable datasets loaded.');
 end
 
-%% ================== OUTPUT 1: SPECIFIC POWER vs. TIME-SINCE-START ==================
-figure('Name', 'Specific Power vs. Time Since Braking Event Start');
-
-subplot(2,1,1); hold on; grid on;
-for e = 1:nEvents
-    plot(events_front(e).t_rel, events_front(e).q_inst, 'r-', 'LineWidth', 0.75, 'Color', [1 0 0 0.35]);
+%% ================== DATA-DRIVEN PADFRAC ANCHOR CONSTANTS (models 5 & 6) ==================
+% Two of the six default padFrac models below (5: "Anchored to
+% effusivity-based ideal", 6: "Saturating logistic in T,P") were fit in
+% BrakeCoeffOptimizer.m against normalization constants (Tmid_K, dT,
+% Pmid, dP) derived from that run's loaded dataset's observed T/P range,
+% plus a fixed material-property anchor (PadFrac_ideal). None of these
+% were logged as standalone numbers alongside the fitted coefficients, so
+% they're recomputed here, replicating BrakeCoeffOptimizer.m's exact
+% formulas, from the SAME curated_8-2 files those coefficients were fit
+% against. If this script is later pointed at a different dataset,
+% models 5/6 will drift from their logged fit (models 1-4 are unaffected,
+% they don't reference these constants).
+allT_K = []; allP = [];
+for k = 1:numel(datasets)
+    d = datasets(k).derived;
+    allT_K = [allT_K; (d.fr_temp_F - 32)*(5/9) + 273.15; (d.rr_temp_F - 32)*(5/9) + 273.15]; %#ok<AGROW>
+    allP   = [allP; d.frontpressure; d.rearpressure]; %#ok<AGROW>
 end
-xlabel('Time since event start (s)'); ylabel('Specific Power (W/cm^2)');
-title(sprintf('Front Pad Specific Power - %d events', nEvents));
+Tmin_K = min(allT_K); Tmax_K = max(allT_K);
+dT = max(Tmax_K - Tmin_K, 1);
+Pmax = max(allP);
+dP = max(Pmax, 1);
+Tmid_K = (Tmin_K + Tmax_K) / 2;
+Pmid   = Pmax / 2;
 
-subplot(2,1,2); hold on; grid on;
-for e = 1:nEvents
-    plot(events_rear(e).t_rel, events_rear(e).q_inst, 'b-', 'LineWidth', 0.75, 'Color', [0 0 1 0.35]);
+k_rotor = 42.7; rho_rotor = 7850; cp_rotor = 477;       % 4130 steel (BrakeCoeffOptimizer.m)
+xi_rotor = sqrt(k_rotor * rho_rotor * cp_rotor);
+k_pad_mid = 3.0; rho_pad_mid = 2200; cp_pad_mid = 1000; % Porterfield R4-1 estimate (BrakeCoeffOptimizer.m)
+xi_pad_mid = sqrt(k_pad_mid * rho_pad_mid * cp_pad_mid);
+PadFrac_ideal = xi_pad_mid / (xi_pad_mid + xi_rotor);
+
+%% ================== PADFRAC MODEL DEFINITIONS ==================
+% Pre-populated with the 6 candidate padFrac models already fit and
+% logged in BrakeCoeffOptimizer_outputLog.txt (all dated 08-Aug-2026,
+% against carData\curated_8-2, 14 files). Each model carries its OWN
+% cooling coefficients (x1f/b1f/x1r/b1r) since these were jointly fit
+% per padFrac model in BrakeCoeffOptimizer.m - reusing one shared cooling
+% fit across all 6 would confound the "how much does padFrac model choice
+% matter" comparison this array exists for. Edit/replace to test
+% different models/coefficients (e.g. from a different fit session).
+padFracModels(1).name = 'Linear in T only';
+padFracModels(1).x1f = 2.652365; padFracModels(1).b1f = 20.523613;
+padFracModels(1).x1r = 3.976445; padFracModels(1).b1r = 31.498280;
+padFracModels(1).fun = @(T,P) 0.00032746399.*T + 0.18904768;
+
+padFracModels(2).name = 'Linear, independent T and P';
+padFracModels(2).x1f = 2.652364; padFracModels(2).b1f = 20.523599;
+padFracModels(2).x1r = 3.976444; padFracModels(2).b1r = 31.498294;
+padFracModels(2).fun = @(T,P) 0.00032746604.*T + 2.337321e-14.*P + 0.18904668;
+
+padFracModels(3).name = 'Linear with T*P interaction';
+padFracModels(3).x1f = 0.481861; padFracModels(3).b1f = 23.217170;
+padFracModels(3).x1r = 1.985525; padFracModels(3).b1r = 32.498980;
+padFracModels(3).fun = @(T,P) 0.0014134517.*T + 3.75409e-14.*P + (-9.1902347e-07).*T.*P + (-0.004423408);
+
+padFracModels(4).name = 'Quadratic in T, linear in P';
+padFracModels(4).x1f = 2.725872; padFracModels(4).b1f = 20.842806;
+padFracModels(4).x1r = 4.245275; padFracModels(4).b1r = 28.887733;
+padFracModels(4).fun = @(T,P) -0.0023689048.*T + 2.2448482e-06.*T.^2 + 4.1746139e-14.*P + 0.95659049;
+
+padFracModels(5).name = 'Anchored to effusivity-based ideal';
+padFracModels(5).x1f = 3.814704; padFracModels(5).b1f = 21.979610;
+padFracModels(5).x1r = 5.204694; padFracModels(5).b1r = 31.916136;
+padFracModels(5).fun = @(T,P) PadFrac_ideal + 0.063648258.*(T-Tmid_K)/dT + (-0.15).*(P-Pmid)/dP + 0.05;
+
+padFracModels(6).name = 'Saturating logistic in T,P';
+padFracModels(6).x1f = 1.739543; padFracModels(6).b1f = 22.703051;
+padFracModels(6).x1r = 2.800998; padFracModels(6).b1r = 31.999906;
+padFracModels(6).fun = @(T,P) 0.58618802 ./ (1 + exp(-(3.6032465.*(T-Tmid_K)/dT + (-5.2487399).*(P-Pmid)/dP + 0.44358205)));
+
+C = struct('VehicleMass', VehicleMass, 'RotorMass_front', RotorMass_front, 'RotorMass_rear', RotorMass_rear, ...
+    'RotorArea_front', RotorArea_front, 'RotorArea_rear', RotorArea_rear, 'I', I, 'WheelR', WheelR, ...
+    'TambC', TambC, 'TambK', TambK, 'A_pad_front_cm2', A_pad_front_cm2, 'A_pad_rear_cm2', A_pad_rear_cm2, ...
+    'BrakeFrac', BrakeFrac, 'CalibrationFactor', CalibrationFactor, 'min_pressure', min_pressure, ...
+    'min_omega_wheel_rad_s', min_omega_wheel_rad_s, 'min_pressure_muratio_psi', min_pressure_muratio_psi, ...
+    'mu_ratio_fade_threshold', mu_ratio_fade_threshold, 'n_temp_bins', n_temp_bins, 'n_flux_bins', n_flux_bins, ...
+    'min_samples_per_bin', min_samples_per_bin, 'lagged_flux_window_s', lagged_flux_window_s, ...
+    'RegenFailure_Speed_mps', RegenFailure_Speed_mps, 'RegenFailure_Decel_g', RegenFailure_Decel_g, ...
+    'RegenFailure_TbiasFront', RegenFailure_TbiasFront, ...
+    'maxSpeedSeen', maxSpeedSeen, 'sumTbias', sumTbias, 'countTbias', countTbias);
+
+%% ================== RUN ANALYSIS PER PADFRAC MODEL ==================
+modelResults = struct('name', {}, 'avg_q_front', {}, 'avg_q_rear', {});
+for m = 1:numel(padFracModels)
+    modelResults(m) = run_model_analysis(datasets, padFracModels(m), m, C);
 end
-xlabel('Time since event start (s)'); ylabel('Specific Power (W/cm^2)');
-title(sprintf('Rear Pad Specific Power - %d events', nEvents));
 
-%% ================== OUTPUT 2: AVERAGE SPECIFIC POWER ==================
-avg_q_front_all = mean([events_front.avg_q]);
-avg_q_rear_all  = mean([events_rear.avg_q]);
-avg_q_combined  = mean([[events_front.avg_q], [events_rear.avg_q]]);
+%% ================== CROSS-MODEL SUMMARY: HOW MUCH DOES PADFRAC MODEL CHOICE MATTER? ==================
+fprintf('\n================ CROSS-MODEL SUMMARY ================\n');
+for m = 1:numel(modelResults)
+    fprintf('M%d: %s\n', m, modelResults(m).name);
+end
 
-fprintf('\n================ SPECIFIC POWER SUMMARY ================\n');
-fprintf('Events analyzed: %d\n', nEvents);
-fprintf('Average specific power, FRONT pads: %.3f W/cm^2\n', avg_q_front_all);
-fprintf('Average specific power, REAR pads:  %.3f W/cm^2\n', avg_q_rear_all);
-fprintf('Average specific power, COMBINED (front+rear pooled, same pad material): %.3f W/cm^2\n', avg_q_combined);
-fprintf('Peak per-event average, FRONT: %.3f W/cm^2\n', max([events_front.avg_q]));
-fprintf('Peak per-event average, REAR:  %.3f W/cm^2\n', max([events_rear.avg_q]));
-fprintf('Peak instantaneous, FRONT: %.3f W/cm^2\n', max(cellfun(@(x) max([x; 0]), {events_front.q_inst})));
-fprintf('Peak instantaneous, REAR:  %.3f W/cm^2\n', max(cellfun(@(x) max([x; 0]), {events_rear.q_inst})));
+figure('Name', 'Cross-Model Specific Power Comparison');
 
-%% ================== OUTPUT 3: BOX-AND-WHISKER PLOT ==================
-front_vals = [events_front.avg_q]';
-rear_vals  = [events_rear.avg_q]';
-all_vals   = [front_vals; rear_vals];
-grp        = [repmat({'Front'}, numel(front_vals), 1); repmat({'Rear'}, numel(rear_vals), 1)];
-
-figure('Name', 'Average Specific Power per Braking Event');
-boxplot(all_vals, grp);
-ylabel('Average Specific Power (W/cm^2)');
-title(sprintf('Per-Event Average Specific Power (n = %d events)', nEvents));
+% --- Left: grouped box-and-whisker, one box per model x corner ---
+subplot(1,2,1);
+allVals = []; grp = {}; order = {};
+for m = 1:numel(modelResults)
+    fLabel = sprintf('M%d Front', m); rLabel = sprintf('M%d Rear', m);
+    order = [order, {fLabel, rLabel}]; %#ok<AGROW>
+    allVals = [allVals; modelResults(m).avg_q_front(:); modelResults(m).avg_q_rear(:)]; %#ok<AGROW>
+    grp = [grp; repmat({fLabel}, numel(modelResults(m).avg_q_front), 1); ...
+                 repmat({rLabel}, numel(modelResults(m).avg_q_rear), 1)]; %#ok<AGROW>
+end
+boxplot(allVals, grp, 'GroupOrder', order);
+ylabel('Avg Specific Power per Event (W/cm^2)');
+title('Spread by Model (box = IQR, line = median)');
+xtickangle(45);
 grid on;
 
-%% ================== OUTPUT 4: FADE CORRELATION HEATMAPS ==================
-% mu_ratio vs specific power, with temperature visible (not collapsed
-% away) - mu has its own normal temperature dependence independent of
-% fade, so a plain 2D scatter of mu_ratio vs flux alone would be
-% misleading. Two flux definitions (instantaneous and lagged) are shown
-% side by side per corner.
-figure('Name', 'Fade Correlation: mu Ratio vs Specific Power and Temperature');
-
-subplot(2,2,1);
-plotFadeHeatmap(fade_samples_front(:,1), fade_samples_front(:,3), fade_samples_front(:,4), ...
-    'Front - Instantaneous Flux');
-subplot(2,2,2);
-plotFadeHeatmap(fade_samples_front(:,2), fade_samples_front(:,3), fade_samples_front(:,4), ...
-    sprintf('Front - %.1fs Lagged Flux', lagged_flux_window_s));
-subplot(2,2,3);
-plotFadeHeatmap(fade_samples_rear(:,1), fade_samples_rear(:,3), fade_samples_rear(:,4), ...
-    'Rear - Instantaneous Flux');
-subplot(2,2,4);
-plotFadeHeatmap(fade_samples_rear(:,2), fade_samples_rear(:,3), fade_samples_rear(:,4), ...
-    sprintf('Rear - %.1fs Lagged Flux', lagged_flux_window_s));
-
-%% ================== OUTPUT 5: FADE-ONSET THRESHOLD DETECTION ==================
-% mu_ratio = mu_actual/mu_nominal, where mu_actual comes from dynamics
-% (wheel deceleration), NOT from pressure+assumed mu - so this ratio
-% dropping below 1.0 is a real friction-coefficient shortfall, not a
-% modeling artifact. Binned by temperature first (to control for mu's
-% normal temperature dependence), then by specific power within each
-% temperature bin, to find where the ratio drops below
-% mu_ratio_fade_threshold and stays there as flux keeps increasing.
-fadeFront = analyzeFadeOnset(fade_samples_front, mu_ratio_fade_threshold, ...
-    n_temp_bins, n_flux_bins, min_samples_per_bin);
-fadeRear  = analyzeFadeOnset(fade_samples_rear, mu_ratio_fade_threshold, ...
-    n_temp_bins, n_flux_bins, min_samples_per_bin);
-
-fprintf('\n================ FADE-ONSET ANALYSIS ================\n');
-fprintf('Fade defined as mu_actual/mu_nominal dropping below %.2f and staying there as flux increases.\n', ...
-    mu_ratio_fade_threshold);
-fprintf('Computed within %d temperature bins to control for mu''s own normal temperature dependence.\n\n', ...
-    n_temp_bins);
-
-report_fade_corner('FRONT', fadeFront, A_pad_front_cm2, avg_q_front_all, ...
-    max([events_front.avg_q]), lagged_flux_window_s);
-report_fade_corner('REAR', fadeRear, A_pad_rear_cm2, avg_q_rear_all, ...
-    max([events_rear.avg_q]), lagged_flux_window_s);
-
-%% ================== OUTPUT 6: DRIVE-TYPE BREAKDOWN ==================
-driveCats = {'Endurance', 'Autocross', 'Other/Misc'};
-meanQ_front = nan(numel(driveCats),1); semQ_front = nan(numel(driveCats),1); nQ_front = zeros(numel(driveCats),1);
-meanQ_rear  = nan(numel(driveCats),1); semQ_rear  = nan(numel(driveCats),1); nQ_rear  = zeros(numel(driveCats),1);
-
-frontDriveTypes = {events_front.driveType};
-rearDriveTypes  = {events_rear.driveType};
-frontAvgQ = [events_front.avg_q];
-rearAvgQ  = [events_rear.avg_q];
-
-for c = 1:numel(driveCats)
-    maskF = strcmp(frontDriveTypes, driveCats{c});
-    maskR = strcmp(rearDriveTypes, driveCats{c});
-    nQ_front(c) = sum(maskF);
-    nQ_rear(c)  = sum(maskR);
-    if nQ_front(c) > 0
-        meanQ_front(c) = mean(frontAvgQ(maskF));
-        semQ_front(c)  = std(frontAvgQ(maskF)) / sqrt(nQ_front(c));
-    end
-    if nQ_rear(c) > 0
-        meanQ_rear(c) = mean(rearAvgQ(maskR));
-        semQ_rear(c)  = std(rearAvgQ(maskR)) / sqrt(nQ_rear(c));
+% --- Right: overlaid fitted PDFs, one per model (front+rear pooled) ---
+subplot(1,2,2); hold on; grid on;
+colors = lines(numel(modelResults));
+for m = 1:numel(modelResults)
+    pooled = [modelResults(m).avg_q_front(:); modelResults(m).avg_q_rear(:)];
+    distFit = fit_distribution_summary(pooled);
+    if ~isempty(distFit.pd)
+        xg = linspace(min(pooled), max(pooled), 200);
+        plot(xg, pdf(distFit.pd, xg), 'Color', colors(m,:), 'LineWidth', 1.5, ...
+            'DisplayName', sprintf('M%d: %s', m, modelResults(m).name));
     end
 end
-
-figure('Name', 'Average Specific Power by Drive Type');
-barVals = [meanQ_front, meanQ_rear];
-b = bar(barVals);
-hold on;
-errorbar(b(1).XEndPoints, meanQ_front, semQ_front, 'k.', 'LineWidth', 1);
-errorbar(b(2).XEndPoints, meanQ_rear,  semQ_rear,  'k.', 'LineWidth', 1);
-set(gca, 'XTick', 1:numel(driveCats), 'XTickLabel', driveCats);
-ylabel('Average Specific Power (W/cm^2)');
-legend({'Front', 'Rear'}, 'Location', 'best');
-title('Average Specific Power by Drive Type (error bars = SEM)');
-grid on;
-
-fprintf('================ DRIVE-TYPE BREAKDOWN ================\n');
-for c = 1:numel(driveCats)
-    fprintf('%-12s Front: %.3f W/cm^2 (n=%d events)   Rear: %.3f W/cm^2 (n=%d events)\n', ...
-        driveCats{c}, meanQ_front(c), nQ_front(c), meanQ_rear(c), nQ_rear(c));
-end
-fprintf('\n');
-
-%% ================== OUTPUT 7: REGEN-FAILURE WORST-CASE MARGIN ==================
-fprintf('================ REGEN-FAILURE WORST-CASE MARGIN ================\n');
-fprintf(['NOTE: the assumptions below are editable placeholders (see ', ...
-    '"REGEN-FAILURE WORST-CASE ASSUMPTIONS" near the top of the script) - ', ...
-    'review before trusting the back-calculated pad area.\n\n']);
-
-if isempty(RegenFailure_Speed_mps)
-    v0 = maxSpeedSeen;
-    fprintf('Speed assumption: max speed observed in loaded data = %.1f m/s (%.1f mph)\n', v0, v0*2.23694);
-else
-    v0 = RegenFailure_Speed_mps;
-    fprintf('Speed assumption: user-specified = %.1f m/s (%.1f mph)\n', v0, v0*2.23694);
-end
-
-if isempty(RegenFailure_TbiasFront)
-    if countTbias > 0
-        TbiasF = sumTbias / countTbias;
-    else
-        TbiasF = 0.5;
-        warning('No valid Tbias_brake samples observed - defaulting regen-failure split to 0.5/0.5.');
-    end
-    fprintf('Front/rear split: mean observed Tbias_brake = %.3f\n', TbiasF);
-else
-    TbiasF = RegenFailure_TbiasFront;
-    fprintf('Front/rear split: user-specified Tbias = %.3f\n', TbiasF);
-end
-
-a_decel = RegenFailure_Decel_g * 9.81;
-fprintf('Assumed constant deceleration: %.2f g (%.2f m/s^2)\n', RegenFailure_Decel_g, a_decel);
-
-F_total = VehicleMass * a_decel;    % N, ALL via friction (zero regen assumed)
-P_total_peak = F_total * v0;        % W, peak power at t=0 (highest speed, constant-decel stop)
-P_front_peak = P_total_peak * TbiasF * 0.5;         % per SINGLE front corner
-P_rear_peak  = P_total_peak * (1 - TbiasF) * 0.5;   % per SINGLE rear corner
-
-fprintf('Peak total friction power at t=0: %.1f kW\n', P_total_peak/1000);
-fprintf('Peak per-corner power: front = %.2f kW, rear = %.2f kW\n\n', P_front_peak/1000, P_rear_peak/1000);
-
-qOnsetFront = fadeFront.q_inst.onsetOverall;
-qOnsetRear  = fadeRear.q_inst.onsetOverall;
-
-if isfinite(qOnsetFront) && qOnsetFront > 0
-    A_required_front_cm2 = P_front_peak / qOnsetFront;
-    fprintf(['Front: required pad area to stay at/under fade-onset flux = %.1f cm^2 ', ...
-        '(currently %.1f cm^2, margin factor %.2fx)\n'], ...
-        A_required_front_cm2, A_pad_front_cm2, A_pad_front_cm2/A_required_front_cm2);
-else
-    fprintf('Front: fade-onset flux not determined from the loaded data - cannot back-calculate required area.\n');
-end
-
-if isfinite(qOnsetRear) && qOnsetRear > 0
-    A_required_rear_cm2 = P_rear_peak / qOnsetRear;
-    fprintf(['Rear: required pad area to stay at/under fade-onset flux = %.1f cm^2 ', ...
-        '(currently %.1f cm^2, margin factor %.2fx)\n'], ...
-        A_required_rear_cm2, A_pad_rear_cm2, A_pad_rear_cm2/A_required_rear_cm2);
-else
-    fprintf('Rear: fade-onset flux not determined from the loaded data - cannot back-calculate required area.\n');
-end
+xlabel('Avg Specific Power (W/cm^2), front+rear pooled'); ylabel('Probability Density');
+title('Distribution Shift by Model');
+legend('Location', 'best', 'FontSize', 7, 'Interpreter', 'none');
 
 
 %% ================================================================
@@ -689,14 +546,21 @@ function sim = simulate_pad_power(t, velx, BrakePress, Tbias, x1_p, b1_p, padfra
 % friction energy partitions into heat afterward, not how much torque
 % the brake actually applied. Aero and regen ARE still subtracted, since
 % both physically bypass the friction brake entirely.
+%
+% Also exposes per-step regen_energy/friction_energy (both zero outside
+% the active-braking branch, same convention as pad_energy) so callers
+% can compute what fraction of an event's braking energy was handled by
+% regen vs. friction without recomputing this loop's KE/aero logic.
 
 n = length(t);
 RotorTempArrayK = zeros(n, 1);
 RotorTempArrayK(1) = TambC + 273.15;   % assume ambient at dataset start
-pad_energy = zeros(n, 1);   % J, per single pad, per step
-q_inst     = zeros(n, 1);   % W/cm^2, per single pad, per step
-T_actual   = nan(n, 1);     % Nm, per single corner, dynamics-based
-mu_ratio   = nan(n, 1);     % T_actual / T_predicted
+pad_energy      = zeros(n, 1);   % J, per single pad, per step
+q_inst          = zeros(n, 1);   % W/cm^2, per single pad, per step
+T_actual        = nan(n, 1);     % Nm, per single corner, dynamics-based
+mu_ratio        = nan(n, 1);     % T_actual / T_predicted
+regen_energy    = zeros(n, 1);   % J, per step (vehicle-level, before axle/corner split)
+friction_energy = zeros(n, 1);   % J, per step (vehicle-level, before axle/corner split)
 
 for i = 2:n
     prevSpeed = velx(i-1);
@@ -725,12 +589,12 @@ for i = 2:n
         Energy2 = 4 * (0.5 * I * (omegaP^2 - omegaN^2));
         Energy  = Energy1 + Energy2;
 
-        regen_energy    = abs(total_regen_power(i)) * tbrake;
-        friction_energy = max(Energy - regen_energy, 0);
+        regen_energy(i)    = abs(total_regen_power(i)) * tbrake;
+        friction_energy(i) = max(Energy - regen_energy(i), 0);
         AeroFrac  = min(Edrag(i) / max(Energy, 1), 1);
 
         % Rotor share (drives rotor temp forward, same as brake_temp_sim.m)
-        CorrectedEnergyRotor = friction_energy * corner_split * Tbias(i) * (1 - AeroFrac) * (1 - PadFrac) * BrakeFrac * CalibrationFactor;
+        CorrectedEnergyRotor = friction_energy(i) * corner_split * Tbias(i) * (1 - AeroFrac) * (1 - PadFrac) * BrakeFrac * CalibrationFactor;
         deltaTK = CorrectedEnergyRotor / (RotorMass * SpecHeat);
         RotorTempArrayK(i) = deltaTK + prevTemp;
 
@@ -740,7 +604,7 @@ for i = 2:n
         RotorTempArrayK(i) = RotorTempArrayK(i) - deltaTKout;
 
         % Pad share (this is what we report as specific power)
-        CorrectedEnergyPad = friction_energy * corner_split * Tbias(i) * (1 - AeroFrac) * PadFrac * BrakeFrac * CalibrationFactor;
+        CorrectedEnergyPad = friction_energy(i) * corner_split * Tbias(i) * (1 - AeroFrac) * PadFrac * BrakeFrac * CalibrationFactor;
         pad_energy(i) = CorrectedEnergyPad;
         q_inst(i)     = CorrectedEnergyPad / tbrake / A_pad_cm2;
 
@@ -748,7 +612,7 @@ for i = 2:n
         % power at this corner, divided by wheel angular velocity. Gated
         % on a minimum omega to avoid Power/omega blowing up near a stop.
         if omegaN > min_omega_wheel_rad_s
-            T_actual_axle_power = (friction_energy / tbrake) * Tbias(i) * (1 - AeroFrac);
+            T_actual_axle_power = (friction_energy(i) / tbrake) * Tbias(i) * (1 - AeroFrac);
             T_actual(i) = T_actual_axle_power * corner_split / omegaN;
             if isfinite(T_predicted(i)) && T_predicted(i) > 1e-6 && BrakePress(i) > min_pressure_muratio
                 mu_ratio(i) = T_actual(i) / T_predicted(i);
@@ -759,15 +623,18 @@ for i = 2:n
         Eout = qout * tbrake;
         deltaTKout = Eout / (RotorMass * SpecHeat);
         RotorTempArrayK(i) = prevTemp - deltaTKout;
-        % pad_energy(i), q_inst(i), T_actual(i), mu_ratio(i) remain 0/NaN
+        % pad_energy(i), q_inst(i), T_actual(i), mu_ratio(i), regen_energy(i),
+        % friction_energy(i) remain 0/NaN
     end
 end
 
-sim.RotorTempArrayK = RotorTempArrayK;
-sim.pad_energy      = pad_energy;
+sim.RotorTempArrayK  = RotorTempArrayK;
+sim.pad_energy       = pad_energy;
 sim.q_inst           = q_inst;
 sim.T_actual         = T_actual;
 sim.mu_ratio         = mu_ratio;
+sim.regen_energy     = regen_energy;
+sim.friction_energy  = friction_energy;
 end
 
 
@@ -890,7 +757,7 @@ function plotFadeHeatmap(flux, tempF, muRatio, titleStr)
 % true outliers. Only the upper tail is ever filtered - low mu_ratio is
 % genuine fade signal, never noise, so it's never excluded. This filtering
 % is local to the plot only; it does NOT touch the fade_samples_*/
-% analyzeFadeOnset data used by Output 5/7. The omitted count is reported
+% analyzeFadeOnset data used by Output 5/8. The omitted count is reported
 % both to the console and in the subplot title so the omission itself
 % stays visible.
 valid = isfinite(flux) & isfinite(tempF) & isfinite(muRatio);
@@ -1050,4 +917,435 @@ if isfinite(fadeResult.q_inst.cv) && isfinite(fadeResult.q_lag.cv)
     end
 end
 fprintf('\n');
+end
+
+
+function fitResult = fit_distribution_summary(data)
+% Fits candidate distributions to `data` and selects the best by AIC
+% (2*k - 2*loglikelihood), computed manually since fitdist objects don't
+% expose a uniform AIC property across distribution types. Requires the
+% Statistics and Machine Learning Toolbox (already an implicit dependency
+% of this script via quantile/boxplot).
+data = data(:);
+data = data(isfinite(data));
+fitResult = struct('n', numel(data), 'mean', NaN, 'median', NaN, 'std', NaN, ...
+    'skew', NaN, 'bestName', 'insufficient data', 'bestParams', [], 'pd', []);
+
+if fitResult.n == 0
+    return
+end
+
+fitResult.mean   = mean(data);
+fitResult.median = median(data);
+fitResult.std    = std(data);
+fitResult.skew   = skewness(data);
+
+if fitResult.n < 5
+    fitResult.bestName = sprintf('insufficient data (n=%d)', fitResult.n);
+    return
+end
+
+candidates = {'Normal', 'Lognormal', 'Gamma', 'Weibull'};
+bestAIC = Inf;
+for c = 1:numel(candidates)
+    try
+        pd = fitdist(data, candidates{c});
+        % Clip pdf values away from exact 0 before taking log: a single
+        % far-outlier point can otherwise underflow pdf() to 0.0 and send
+        % the log-likelihood to -Inf, disqualifying an otherwise-reasonable
+        % fit via the isfinite(aic) check below instead of just penalizing
+        % it (which is what should happen for one bad point).
+        ll = sum(log(max(pdf(pd, data), realmin)));
+        k  = numel(pd.ParameterNames);
+        aic = 2*k - 2*ll;
+        if isfinite(aic) && aic < bestAIC
+            bestAIC = aic;
+            fitResult.bestName   = candidates{c};
+            fitResult.bestParams = pd.ParameterValues;
+            fitResult.pd         = pd;
+        end
+    catch
+        continue   % candidate not valid for this data (e.g. non-positive values)
+    end
+end
+end
+
+
+function [fitFront, fitRear] = plot_distribution_overlay(dataFront, dataRear, titleStr)
+% Overlaid front (red) / rear (blue) probability-density histograms with
+% each series' best-fit PDF curve drawn on top. Plots into the CURRENT
+% axes (call subplot(...) beforehand), matching plotFadeHeatmap's style.
+% Returns both fit results so the caller can also build a stats table
+% from them without recomputing.
+fitFront = fit_distribution_summary(dataFront);
+fitRear  = fit_distribution_summary(dataRear);
+
+hold on; grid on;
+if fitFront.n > 0
+    histogram(dataFront, 'Normalization', 'pdf', 'FaceColor', 'r', 'FaceAlpha', 0.35, ...
+        'EdgeColor', 'none', 'DisplayName', 'Front');
+end
+if fitRear.n > 0
+    histogram(dataRear, 'Normalization', 'pdf', 'FaceColor', 'b', 'FaceAlpha', 0.35, ...
+        'EdgeColor', 'none', 'DisplayName', 'Rear');
+end
+
+if ~isempty(fitFront.pd)
+    xg = linspace(min(dataFront), max(dataFront), 200);
+    plot(xg, pdf(fitFront.pd, xg), 'r-', 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('Front fit: %s', fitFront.bestName));
+end
+if ~isempty(fitRear.pd)
+    xg = linspace(min(dataRear), max(dataRear), 200);
+    plot(xg, pdf(fitRear.pd, xg), 'b-', 'LineWidth', 1.5, ...
+        'DisplayName', sprintf('Rear fit: %s', fitRear.bestName));
+end
+
+xlabel('Avg Specific Power (W/cm^2)'); ylabel('Probability Density');
+title(titleStr, 'Interpreter', 'none');
+legend('Location', 'best', 'FontSize', 7);
+end
+
+
+function row = format_stats_row(groupLabel, cornerLabel, fitResult)
+% Formats one fit_distribution_summary result into a uitable row.
+if isempty(fitResult.bestParams)
+    paramsStr = '-';
+else
+    paramsStr = sprintf('%.4g, ', fitResult.bestParams);
+    paramsStr = paramsStr(1:end-2);   % drop trailing ", "
+end
+row = {groupLabel, cornerLabel, fitResult.n, ...
+    round(fitResult.mean, 3), round(fitResult.median, 3), round(fitResult.std, 3), ...
+    round(fitResult.skew, 3), fitResult.bestName, paramsStr};
+end
+
+
+function modelResult = run_model_analysis(datasets, model, modelIdx, C)
+% Runs the full per-model analysis pipeline (simulation -> events -> all
+% figures) for ONE padFrac model, using the already-loaded/parsed/
+% event-detected per-file data cached in `datasets` (see "LOAD & CACHE
+% PER-FILE DATA" in the main script). Every figure/title/console header
+% is tagged with modelIdx/model.name so multiple models' outputs stay
+% distinguishable when run back to back. Returns a compact modelResult
+% (name + per-event avg_q vectors) used to build the final cross-model
+% summary figure after all models have been run.
+
+tag = sprintf('[M%d: %s]', modelIdx, model.name);
+fprintf('\n================ %s ================\n', tag);
+
+VehicleMass = C.VehicleMass; RotorMass_front = C.RotorMass_front; RotorMass_rear = C.RotorMass_rear;
+RotorArea_front = C.RotorArea_front; RotorArea_rear = C.RotorArea_rear; I = C.I; WheelR = C.WheelR;
+TambC = C.TambC; TambK = C.TambK; A_pad_front_cm2 = C.A_pad_front_cm2; A_pad_rear_cm2 = C.A_pad_rear_cm2;
+BrakeFrac = C.BrakeFrac; CalibrationFactor = C.CalibrationFactor; min_pressure = C.min_pressure;
+min_omega_wheel_rad_s = C.min_omega_wheel_rad_s; min_pressure_muratio_psi = C.min_pressure_muratio_psi;
+mu_ratio_fade_threshold = C.mu_ratio_fade_threshold; n_temp_bins = C.n_temp_bins; n_flux_bins = C.n_flux_bins;
+min_samples_per_bin = C.min_samples_per_bin; lagged_flux_window_s = C.lagged_flux_window_s;
+RegenFailure_Speed_mps = C.RegenFailure_Speed_mps; RegenFailure_Decel_g = C.RegenFailure_Decel_g;
+RegenFailure_TbiasFront = C.RegenFailure_TbiasFront;
+maxSpeedSeen = C.maxSpeedSeen; sumTbias = C.sumTbias; countTbias = C.countTbias;
+
+events_front = struct('dataset', {}, 't_rel', {}, 'q_inst', {}, 'avg_q', {}, 't_decel', {}, ...
+    'driveType', {}, 'start_speed_mph', {}, 'decel_g', {}, 'regen_pct', {}, 'T_rotor_start_F', {});
+events_rear  = struct('dataset', {}, 't_rel', {}, 'q_inst', {}, 'avg_q', {}, 't_decel', {}, ...
+    'driveType', {}, 'start_speed_mph', {}, 'decel_g', {}, 'regen_pct', {}, 'T_rotor_start_F', {});
+
+fade_samples_front = zeros(0, 4);
+fade_samples_rear  = zeros(0, 4);
+
+for k = 1:numel(datasets)
+    ds = datasets(k);
+    derived = ds.derived;
+    t = ds.t;
+    Edrag = ds.Edrag;
+
+    sim_front = simulate_pad_power(t, derived.velx, derived.frontpressure, derived.Tbias_brake, ...
+        model.x1f, model.b1f, model.fun, derived.total_regen_power, Edrag, ...
+        derived.fl_omega_wheel, derived.fr_omega_wheel, ...
+        VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, TambK, ...
+        A_pad_front_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
+        derived.T_predicted_front, min_omega_wheel_rad_s, min_pressure_muratio_psi);
+
+    sim_rear = simulate_pad_power(t, derived.velx, derived.rearpressure, 1 - derived.Tbias_brake, ...
+        model.x1r, model.b1r, model.fun, derived.total_regen_power, Edrag, ...
+        derived.rl_omega_wheel, derived.rr_omega_wheel, ...
+        VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, TambK, ...
+        A_pad_rear_cm2, BrakeFrac, CalibrationFactor, min_pressure, 0.5, TambC, ...
+        derived.T_predicted_rear, min_omega_wheel_rad_s, min_pressure_muratio_psi);
+
+    dt_ds = median(diff(t), 'omitnan');
+    lag_window_samples = max(1, round(lagged_flux_window_s / max(dt_ds, eps)));
+    q_lag_front = movmean(sim_front.q_inst, [lag_window_samples-1, 0]);
+    q_lag_rear  = movmean(sim_rear.q_inst,  [lag_window_samples-1, 0]);
+
+    event_ranges = ds.event_ranges;
+
+    for e = 1:size(event_ranges, 1)
+        i0 = event_ranges(e, 1);
+        i1 = event_ranges(e, 2);
+        t_decel = t(i1) - t(i0);
+        if t_decel <= 0
+            continue
+        end
+        idx = (i0+1):i1;   % energies are defined on steps 2:end
+
+        start_speed_mps = derived.velx(i0);
+        end_speed_mps   = derived.velx(i1);
+        decel_g         = (start_speed_mps - end_speed_mps) / t_decel / 9.81;
+        start_speed_mph = start_speed_mps * 2.23694;
+
+        t_rel_f = t(idx) - t(i0);
+        q_inst_f = sim_front.q_inst(idx);
+        total_E_f = sum(sim_front.pad_energy(idx));
+        avg_q_f = total_E_f / t_decel / A_pad_front_cm2;
+        regen_pct_f = 100 * sum(sim_front.regen_energy(idx)) / ...
+            max(sum(sim_front.regen_energy(idx)) + sum(sim_front.friction_energy(idx)), eps);
+
+        t_rel_r = t(idx) - t(i0);
+        q_inst_r = sim_rear.q_inst(idx);
+        total_E_r = sum(sim_rear.pad_energy(idx));
+        avg_q_r = total_E_r / t_decel / A_pad_rear_cm2;
+        regen_pct_r = 100 * sum(sim_rear.regen_energy(idx)) / ...
+            max(sum(sim_rear.regen_energy(idx)) + sum(sim_rear.friction_energy(idx)), eps);
+
+        events_front(end+1) = struct('dataset', ds.name, 't_rel', t_rel_f, ...
+            'q_inst', q_inst_f, 'avg_q', avg_q_f, 't_decel', t_decel, 'driveType', ds.driveType, ...
+            'start_speed_mph', start_speed_mph, 'decel_g', decel_g, 'regen_pct', regen_pct_f, ...
+            'T_rotor_start_F', derived.fr_temp_F(i0)); %#ok<AGROW>
+        events_rear(end+1) = struct('dataset', ds.name, 't_rel', t_rel_r, ...
+            'q_inst', q_inst_r, 'avg_q', avg_q_r, 't_decel', t_decel, 'driveType', ds.driveType, ...
+            'start_speed_mph', start_speed_mph, 'decel_g', decel_g, 'regen_pct', regen_pct_r, ...
+            'T_rotor_start_F', derived.rr_temp_F(i0)); %#ok<AGROW>
+
+        % Pool per-sample fade-analysis data. NaN entries (gated out by
+        % the omega/pressure thresholds inside simulate_pad_power) are
+        % dropped here rather than propagated into the binning step.
+        mu_f = sim_front.mu_ratio(idx);
+        keep_f = isfinite(mu_f);
+        fade_samples_front = [fade_samples_front; ...
+            q_inst_f(keep_f), q_lag_front(idx(keep_f)), derived.fr_temp_F(idx(keep_f)), mu_f(keep_f)]; %#ok<AGROW>
+
+        mu_r = sim_rear.mu_ratio(idx);
+        keep_r = isfinite(mu_r);
+        fade_samples_rear = [fade_samples_rear; ...
+            q_inst_r(keep_r), q_lag_rear(idx(keep_r)), derived.rr_temp_F(idx(keep_r)), mu_r(keep_r)]; %#ok<AGROW>
+    end
+end
+
+nEvents = numel(events_front);
+if nEvents == 0
+    warning('%s: no braking events found - skipping figures for this model.', tag);
+    modelResult = struct('name', model.name, 'avg_q_front', [], 'avg_q_rear', []);
+    return
+end
+
+%% ---- OUTPUT 1: SPECIFIC POWER vs. TIME-SINCE-START ----
+figure('Name', sprintf('%s Specific Power vs. Time Since Braking Event Start', tag));
+
+subplot(2,1,1); hold on; grid on;
+for e = 1:nEvents
+    plot(events_front(e).t_rel, events_front(e).q_inst, 'r-', 'LineWidth', 0.75, 'Color', [1 0 0 0.35]);
+end
+xlabel('Time since event start (s)'); ylabel('Specific Power (W/cm^2)');
+title(sprintf('%s Front Pad Specific Power - %d events', tag, nEvents), 'Interpreter', 'none');
+
+subplot(2,1,2); hold on; grid on;
+for e = 1:nEvents
+    plot(events_rear(e).t_rel, events_rear(e).q_inst, 'b-', 'LineWidth', 0.75, 'Color', [0 0 1 0.35]);
+end
+xlabel('Time since event start (s)'); ylabel('Specific Power (W/cm^2)');
+title(sprintf('%s Rear Pad Specific Power - %d events', tag, nEvents), 'Interpreter', 'none');
+
+%% ---- OUTPUT 2: AVERAGE SPECIFIC POWER ----
+avg_q_front_all = mean([events_front.avg_q]);
+avg_q_rear_all  = mean([events_rear.avg_q]);
+avg_q_combined  = mean([[events_front.avg_q], [events_rear.avg_q]]);
+
+fprintf('\n%s SPECIFIC POWER SUMMARY\n', tag);
+fprintf('Events analyzed: %d\n', nEvents);
+fprintf('Average specific power, FRONT pads: %.3f W/cm^2\n', avg_q_front_all);
+fprintf('Average specific power, REAR pads:  %.3f W/cm^2\n', avg_q_rear_all);
+fprintf('Average specific power, COMBINED (front+rear pooled, same pad material): %.3f W/cm^2\n', avg_q_combined);
+fprintf('Peak per-event average, FRONT: %.3f W/cm^2\n', max([events_front.avg_q]));
+fprintf('Peak per-event average, REAR:  %.3f W/cm^2\n', max([events_rear.avg_q]));
+fprintf('Peak instantaneous, FRONT: %.3f W/cm^2\n', max(cellfun(@(x) max([x; 0]), {events_front.q_inst})));
+fprintf('Peak instantaneous, REAR:  %.3f W/cm^2\n', max(cellfun(@(x) max([x; 0]), {events_rear.q_inst})));
+
+%% ---- OUTPUT 3: BOX-AND-WHISKER PLOT ----
+front_vals = [events_front.avg_q]';
+rear_vals  = [events_rear.avg_q]';
+all_vals   = [front_vals; rear_vals];
+grp        = [repmat({'Front'}, numel(front_vals), 1); repmat({'Rear'}, numel(rear_vals), 1)];
+
+figure('Name', sprintf('%s Average Specific Power per Braking Event', tag));
+boxplot(all_vals, grp);
+ylabel('Average Specific Power (W/cm^2)');
+title(sprintf('%s Per-Event Average Specific Power (n = %d events)', tag, nEvents), 'Interpreter', 'none');
+grid on;
+
+%% ---- OUTPUT 4: FADE CORRELATION HEATMAPS ----
+% mu_ratio vs specific power, with temperature visible (not collapsed
+% away) - mu has its own normal temperature dependence independent of
+% fade, so a plain 2D scatter of mu_ratio vs flux alone would be
+% misleading. Two flux definitions (instantaneous and lagged) are shown
+% side by side per corner.
+figure('Name', sprintf('%s Fade Correlation: mu Ratio vs Specific Power and Temperature', tag));
+
+subplot(2,2,1);
+plotFadeHeatmap(fade_samples_front(:,1), fade_samples_front(:,3), fade_samples_front(:,4), ...
+    sprintf('%s Front - Instantaneous Flux', tag));
+subplot(2,2,2);
+plotFadeHeatmap(fade_samples_front(:,2), fade_samples_front(:,3), fade_samples_front(:,4), ...
+    sprintf('%s Front - %.1fs Lagged Flux', tag, lagged_flux_window_s));
+subplot(2,2,3);
+plotFadeHeatmap(fade_samples_rear(:,1), fade_samples_rear(:,3), fade_samples_rear(:,4), ...
+    sprintf('%s Rear - Instantaneous Flux', tag));
+subplot(2,2,4);
+plotFadeHeatmap(fade_samples_rear(:,2), fade_samples_rear(:,3), fade_samples_rear(:,4), ...
+    sprintf('%s Rear - %.1fs Lagged Flux', tag, lagged_flux_window_s));
+
+%% ---- OUTPUT 5: FADE-ONSET THRESHOLD DETECTION ----
+% mu_ratio = mu_actual/mu_nominal, where mu_actual comes from dynamics
+% (wheel deceleration), NOT from pressure+assumed mu - so this ratio
+% dropping below 1.0 is a real friction-coefficient shortfall, not a
+% modeling artifact. Binned by temperature first (to control for mu's
+% normal temperature dependence), then by specific power within each
+% temperature bin, to find where the ratio drops below
+% mu_ratio_fade_threshold and stays there as flux keeps increasing.
+fadeFront = analyzeFadeOnset(fade_samples_front, mu_ratio_fade_threshold, ...
+    n_temp_bins, n_flux_bins, min_samples_per_bin);
+fadeRear  = analyzeFadeOnset(fade_samples_rear, mu_ratio_fade_threshold, ...
+    n_temp_bins, n_flux_bins, min_samples_per_bin);
+
+fprintf('\n%s FADE-ONSET ANALYSIS\n', tag);
+fprintf('Fade defined as mu_actual/mu_nominal dropping below %.2f and staying there as flux increases.\n', ...
+    mu_ratio_fade_threshold);
+fprintf('Computed within %d temperature bins to control for mu''s own normal temperature dependence.\n\n', ...
+    n_temp_bins);
+
+report_fade_corner('FRONT', fadeFront, A_pad_front_cm2, avg_q_front_all, ...
+    max([events_front.avg_q]), lagged_flux_window_s);
+report_fade_corner('REAR', fadeRear, A_pad_rear_cm2, avg_q_rear_all, ...
+    max([events_rear.avg_q]), lagged_flux_window_s);
+
+%% ---- OUTPUT 6: DRIVE-TYPE BREAKDOWN - PROBABILITY DISTRIBUTIONS + STATS TABLE ----
+driveCats = {'Endurance', 'Autocross', 'Other/Misc'};
+frontDriveTypes = {events_front.driveType};
+rearDriveTypes  = {events_rear.driveType};
+frontAvgQ = [events_front.avg_q];
+rearAvgQ  = [events_rear.avg_q];
+
+figure('Name', sprintf('%s Avg Specific Power by Drive Type - Distributions', tag));
+tableRows = {};
+for c = 1:numel(driveCats)
+    maskF = strcmp(frontDriveTypes, driveCats{c});
+    maskR = strcmp(rearDriveTypes, driveCats{c});
+
+    subplot(2,3,c);
+    [fitF, fitR] = plot_distribution_overlay(frontAvgQ(maskF), rearAvgQ(maskR), ...
+        sprintf('%s\n(n_{front}=%d, n_{rear}=%d)', driveCats{c}, sum(maskF), sum(maskR)));
+
+    tableRows(end+1,:) = format_stats_row(driveCats{c}, 'Front', fitF); %#ok<AGROW>
+    tableRows(end+1,:) = format_stats_row(driveCats{c}, 'Rear',  fitR); %#ok<AGROW>
+end
+% Bottom row of the 2x3 grid is deliberately left empty (only subplot
+% positions 1-3 are ever used above) so the table can occupy that space
+% without fighting the axes for room.
+uitable('Parent', gcf, 'Units', 'normalized', 'Position', [0.03 0.03 0.94 0.40], ...
+    'Data', tableRows, ...
+    'ColumnName', {'Drive Type', 'Corner', 'n', 'Mean', 'Median', 'Std', 'Skew', 'Best Fit', 'Params'}, ...
+    'ColumnWidth', {80, 50, 40, 70, 70, 70, 60, 90, 220}, 'RowName', []);
+
+fprintf('\n%s DRIVE-TYPE BREAKDOWN\n', tag);
+for c = 1:numel(driveCats)
+    maskF = strcmp(frontDriveTypes, driveCats{c});
+    maskR = strcmp(rearDriveTypes, driveCats{c});
+    fprintf('%-12s Front: n=%d   Rear: n=%d\n', driveCats{c}, sum(maskF), sum(maskR));
+end
+fprintf('\n');
+
+%% ---- OUTPUT 7: SPECIFIC POWER CORRELATIONS ----
+figure('Name', sprintf('%s Specific Power Correlations', tag));
+corrSpecs = {
+    'decel_g',         'Deceleration (g)'
+    'start_speed_mph', 'Starting Speed (mph)'
+    'regen_pct',       'Regen % of Braking Energy'
+    't_decel',         'Event Duration (s)'
+    'T_rotor_start_F', 'Rotor Temp at Event Start (deg F)'
+    };
+for p = 1:size(corrSpecs, 1)
+    fieldName = corrSpecs{p,1};
+    subplot(2,3,p); hold on; grid on;
+    scatter([events_front.(fieldName)], frontAvgQ, 18, 'r', 'filled', ...
+        'MarkerFaceAlpha', 0.5, 'DisplayName', 'Front');
+    scatter([events_rear.(fieldName)], rearAvgQ, 18, 'b', 'filled', ...
+        'MarkerFaceAlpha', 0.5, 'DisplayName', 'Rear');
+    xlabel(corrSpecs{p,2}); ylabel('Specific Power (W/cm^2)');
+    title(sprintf('%s vs. Specific Power', corrSpecs{p,2}), 'Interpreter', 'none');
+    if p == 1
+        legend('Location', 'best');
+    end
+end
+sgtitle(tag, 'Interpreter', 'none');
+
+%% ---- OUTPUT 8: REGEN-FAILURE WORST-CASE MARGIN ----
+fprintf('\n%s REGEN-FAILURE WORST-CASE MARGIN\n', tag);
+fprintf(['NOTE: the assumptions below are editable placeholders (see ', ...
+    '"REGEN-FAILURE WORST-CASE ASSUMPTIONS" near the top of the script) - ', ...
+    'review before trusting the back-calculated pad area.\n\n']);
+
+if isempty(RegenFailure_Speed_mps)
+    v0 = maxSpeedSeen;
+    fprintf('Speed assumption: max speed observed in loaded data = %.1f m/s (%.1f mph)\n', v0, v0*2.23694);
+else
+    v0 = RegenFailure_Speed_mps;
+    fprintf('Speed assumption: user-specified = %.1f m/s (%.1f mph)\n', v0, v0*2.23694);
+end
+
+if isempty(RegenFailure_TbiasFront)
+    if countTbias > 0
+        TbiasF = sumTbias / countTbias;
+    else
+        TbiasF = 0.5;
+        warning('No valid Tbias_brake samples observed - defaulting regen-failure split to 0.5/0.5.');
+    end
+    fprintf('Front/rear split: mean observed Tbias_brake = %.3f\n', TbiasF);
+else
+    TbiasF = RegenFailure_TbiasFront;
+    fprintf('Front/rear split: user-specified Tbias = %.3f\n', TbiasF);
+end
+
+a_decel = RegenFailure_Decel_g * 9.81;
+fprintf('Assumed constant deceleration: %.2f g (%.2f m/s^2)\n', RegenFailure_Decel_g, a_decel);
+
+F_total = VehicleMass * a_decel;    % N, ALL via friction (zero regen assumed)
+P_total_peak = F_total * v0;        % W, peak power at t=0 (highest speed, constant-decel stop)
+P_front_peak = P_total_peak * TbiasF * 0.5;         % per SINGLE front corner
+P_rear_peak  = P_total_peak * (1 - TbiasF) * 0.5;   % per SINGLE rear corner
+
+fprintf('Peak total friction power at t=0: %.1f kW\n', P_total_peak/1000);
+fprintf('Peak per-corner power: front = %.2f kW, rear = %.2f kW\n\n', P_front_peak/1000, P_rear_peak/1000);
+
+qOnsetFront = fadeFront.q_inst.onsetOverall;
+qOnsetRear  = fadeRear.q_inst.onsetOverall;
+
+if isfinite(qOnsetFront) && qOnsetFront > 0
+    A_required_front_cm2 = P_front_peak / qOnsetFront;
+    fprintf(['Front: required pad area to stay at/under fade-onset flux = %.1f cm^2 ', ...
+        '(currently %.1f cm^2, margin factor %.2fx)\n'], ...
+        A_required_front_cm2, A_pad_front_cm2, A_pad_front_cm2/A_required_front_cm2);
+else
+    fprintf('Front: fade-onset flux not determined from the loaded data - cannot back-calculate required area.\n');
+end
+
+if isfinite(qOnsetRear) && qOnsetRear > 0
+    A_required_rear_cm2 = P_rear_peak / qOnsetRear;
+    fprintf(['Rear: required pad area to stay at/under fade-onset flux = %.1f cm^2 ', ...
+        '(currently %.1f cm^2, margin factor %.2fx)\n'], ...
+        A_required_rear_cm2, A_pad_rear_cm2, A_pad_rear_cm2/A_required_rear_cm2);
+else
+    fprintf('Rear: fade-onset flux not determined from the loaded data - cannot back-calculate required area.\n');
+end
+
+modelResult = struct('name', model.name, 'avg_q_front', frontAvgQ, 'avg_q_rear', rearAvgQ);
 end
