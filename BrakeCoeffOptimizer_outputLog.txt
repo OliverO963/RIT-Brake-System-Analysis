@@ -161,3 +161,30 @@ PadFrac params (Saturating logistic in T,P (bounded, cannot collapse to 0) [join
   p(3) = -5.2487399
   p(4) = 0.44358205
 input data: carData\curated_8-2 (14 files)
+
+================ REFIT AFTER PER-COMPONENT SIZING AUDIT ================
+Date and time 14-Aug-2026
+input data: carData\curated_8-2 (14 files)
+All 6 models refit under the corrected per-component physics (see
+SIZING_AUDIT.md): per-corner rotational-KE aggregation, per-corner regen
+attribution, per-dataset ambient + measured-temp seeding, single-side
+clamp force, and mean-pad-radius lever arm. The pre-audit coefficients
+above no longer correspond to this model. All fits below are 'joint'
+strategy (beat 'twostage' on AICc for every model).
+
+Model                                    x1f      b1f      x1r      b1r     RMSE(F)   AICc
+Linear in T only                      2.3669  21.1331   3.6414  29.3594     96.48  2855566.6
+  padFrac: @(T,P) 0.0004609*T + 0.13389
+Linear, independent T and P           2.3669  21.1331   3.6414  29.3594     96.48  2855568.6
+  padFrac: @(T,P) 0.00046091*T + 2.3374e-14*P + 0.13389
+Linear with T*P interaction           0.2886  23.6252   1.7692  30.9199     90.77  2817480.5   <-- lowest AICc
+  padFrac: @(T,P) 0.001538*T + 7.2797e-13*P - 9.3245e-07*T*P - 0.057921
+Quadratic in T, linear in P           2.4898  21.4565   3.9885  26.7070     95.85  2851521.3
+  padFrac: @(T,P) -0.0022399*T + 2.2497e-06*T^2 + 2.3373e-14*P + 0.8988
+Anchored to effusivity-based ideal    3.7213  22.6092   4.9567  30.1357     96.38  2854947.3
+  padFrac: @(T,P) PadFrac_ideal + 0.13218*(T-Tmid_K)/dT - 0.15*(P-Pmid)/dP + 0.05
+Saturating logistic in T,P            1.7024  23.0513   2.6705  30.5203     92.12  2826716.8
+  padFrac: @(T,P) 0.58619 / (1 + exp(-(4.1327*(T-Tmid_K)/dT - 5.2435*(P-Pmid)/dP + 0.45673)))
+
+NOTE: pad mean radius is still seeded at rotor OD/2 pending the documented
+value; replacing it will require another refit.

@@ -20,35 +20,22 @@ clc; clear; close all
 cfg.SkipTimeCropPrompt = true;
 
 %% ================== USER INPUTS ==================
-% Vehicle / rotor parameters (same as BrakeDataAnalysis.m - adjust as needed)
-VehicleMass     = 259;      % kg
-RotorMass_front = 0.5107;   % kg
-RotorMass_rear  = 0.3343;   % kg
-RotorArea_front = 0.038;    % m^2
-RotorArea_rear  = 0.0226;   % m^2
-I               = 0.30754;  % rotational inertia kg*m^2
-WheelR          = 0.213;    % meters
-gear_ratio      = 12.97;    % motor to wheel gear ratio
-TambC           = 25;       % degC - fallback only; each dataset now derives its own ambient (see loading loop)
+% All vehicle/brake/sensor parameters come from the CENTRALIZED spreadsheet
+% VehicleParameters.xlsx so this script and padSpecificPower.m can never
+% drift apart. Every sizing parameter there is declared strictly PER SINGLE
+% COMPONENT (one pad / one rotor / one corner / one caliper) - see
+% loadVehicleParams.m's header for the full convention.
+VP = loadVehicleParams();
 
-% Brake geometry (needed to reconstruct Tbias_brake from raw pressures)
-front_piston_count = 6;
-front_piston_dia   = 0.0157226;  % meters
-front_rotor_dia    = 0.18542;    % meters
-rear_piston_count  = 4;
-rear_piston_dia    = 0.0141732;  % meters
-rear_rotor_dia     = 0.18796;    % meters
-
-% Mu vs temperature lookup table
-mu_temp_table = [100, 200, 300, 400, 500, 600, 700, 800, 900, 950, 1100, 1200];  % degF
-mu_table      = [0.45, 0.46, 0.49, 0.53, 0.55, 0.56, 0.565, 0.565, 0.57, 0.57, 0.535, 0.535];
-
-% Aero drag curve coefficients (drag force in N vs speed in mph)
-aero_open_a   =  0.0793024;   aero_open_b   =  1.46483;    aero_open_c   = -37.23993;
-aero_closed_a =  0.136247;    aero_closed_b =  2.53449;    aero_closed_c = -67.44975;
-
-% Velocity cleaning threshold
-velx_threshold = 34;  % m/s
+VehicleMass     = VP.VehicleMass;       % whole vehicle
+RotorMass_front = VP.RotorMass_front;   % ONE rotor
+RotorMass_rear  = VP.RotorMass_rear;    % ONE rotor
+RotorArea_front = VP.RotorArea_front;   % ONE rotor
+RotorArea_rear  = VP.RotorArea_rear;    % ONE rotor
+I               = VP.I_corner;          % ONE corner
+gear_ratio      = VP.gear_ratio;
+TambC           = VP.TambC_fallback;    % fallback only; each dataset derives its own ambient
+velx_threshold  = VP.velx_threshold;    % m/s
 
 % Seed values (team's current fit) - used as optimizer starting point
 x1_seed = 2.0006;    % h_w slope
@@ -66,18 +53,15 @@ if ischar(files)
 end
 nFiles = numel(files);
 
-aeroParams = struct('front_piston_count', front_piston_count, 'front_piston_dia', front_piston_dia, ...
-    'rear_piston_count', rear_piston_count, 'rear_piston_dia', rear_piston_dia, ...
-    'front_rotor_dia', front_rotor_dia, 'rear_rotor_dia', rear_rotor_dia, ...
-    'mu_temp_table', mu_temp_table, 'mu_table', mu_table, ...
-    'aero_open_a', aero_open_a, 'aero_open_b', aero_open_b, 'aero_open_c', aero_open_c, ...
-    'aero_closed_a', aero_closed_a, 'aero_closed_b', aero_closed_b, 'aero_closed_c', aero_closed_c);
-gearParams = struct('gear_ratio', gear_ratio, 'velx_threshold', velx_threshold);
+% The loaded parameter struct P is passed straight through to
+% compute_derived_quantities - no intermediate aeroParams/gearParams copies,
+% so there is exactly one source for every constant.
 
 datasets = struct('name', {}, 't', {}, 'velx', {}, 'frontpressure', {}, 'rearpressure', {}, ...
     'fr_temp_F', {}, 'rr_temp_F', {}, 'Tbias_brake', {}, 'F_aero', {}, 'Edrag', {}, ...
-    'total_regen_power', {}, 'fl_omega_wheel', {}, 'fr_omega_wheel', {}, ...
-    'rl_omega_wheel', {}, 'rr_omega_wheel', {}, 'TambK', {});
+    'front_axle_regen_power', {}, 'rear_axle_regen_power', {}, ...
+    'fl_omega_wheel', {}, 'fr_omega_wheel', {}, ...
+    'rl_omega_wheel', {}, 'rr_omega_wheel', {}, 'omega_all', {}, 'TambK', {});
 
 for k = 1:nFiles
     fname = fullfile(path, files{k});
@@ -121,7 +105,7 @@ for k = 1:nFiles
     end
 
     parsed  = parse_dataset_columns(raw, fmt);
-    derived = compute_derived_quantities(parsed, gearParams, aeroParams);
+    derived = compute_derived_quantities(parsed, VP);
     Edrag   = compute_edrag(parsed.t, derived.velx, derived.F_aero);
 
     % Per-dataset ambient temperature: average of this dataset's first
@@ -155,11 +139,16 @@ for k = 1:nFiles
     datasets(idx).Tbias_brake       = derived.Tbias_brake;
     datasets(idx).F_aero            = derived.F_aero;
     datasets(idx).Edrag             = Edrag;
-    datasets(idx).total_regen_power = derived.total_regen_power;
+    datasets(idx).front_axle_regen_power = derived.front_axle_regen_power;
+    datasets(idx).rear_axle_regen_power  = derived.rear_axle_regen_power;
     datasets(idx).fl_omega_wheel    = derived.fl_omega_wheel;
     datasets(idx).fr_omega_wheel    = derived.fr_omega_wheel;
     datasets(idx).rl_omega_wheel    = derived.rl_omega_wheel;
     datasets(idx).rr_omega_wheel    = derived.rr_omega_wheel;
+    % Per-corner wheel speeds [fl fr rl rr] for the strictly per-corner
+    % rotational-KE sum inside run_sim_opt.
+    datasets(idx).omega_all = [derived.fl_omega_wheel(:), derived.fr_omega_wheel(:), ...
+                               derived.rl_omega_wheel(:), derived.rr_omega_wheel(:)];
     datasets(idx).TambK             = TambK_dataset;
 
     fprintf('  %d samples, %.1f s duration\n', numel(parsed.t), parsed.t(end) - parsed.t(1));
@@ -345,7 +334,7 @@ results = struct('name', {}, 'params', {}, 'h_wF', {}, 'h_wR', {}, 'padfrac_para
 %                which is a major source of the pressure term drifting to
 %                physically implausible values.
 strategies = {'joint', 'twostage'};
-constPadFracFun = @(T, P, p) PadFrac_ideal; %#ok<NASGU> % placeholder for stage 1 (p unused)
+constPadFracFun = @(T, P, p) PadFrac_ideal;   % placeholder for stage 1 (T,P,p unused)
 
 idx = 0;
 for m = 1:numel(models)
@@ -362,7 +351,7 @@ for m = 1:numel(models)
 
             resFun = @(p) brake_temp_residuals(p, models(m).fun, datasets, ...
                 VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-                I, WheelR, 'all');
+                I, VP, 'all');
 
             [p_opt, ~, residual] = lsqnonlin(resFun, x0, lb, ub, opts);
         else
@@ -372,13 +361,13 @@ for m = 1:numel(models)
             ub_hw = [x1_ub, b1_ub, x1_ub, b1_ub];
             resFun_stage1 = @(hw) brake_temp_residuals([hw(:); 0], constPadFracFun, datasets, ...
                 VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-                I, WheelR, 'cooldown_only');
+                I, VP, 'cooldown_only');
             hw_opt = lsqnonlin(resFun_stage1, x0_hw, lb_hw, ub_hw, opts);
 
             % Stage 2: PadFrac params only, full residual, h_w frozen at Stage-1 result.
             resFun_stage2 = @(pp) brake_temp_residuals([hw_opt(:); pp(:)], models(m).fun, datasets, ...
                 VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-                I, WheelR, 'all');
+                I, VP, 'all');
             [pp_opt, ~, residual] = lsqnonlin(resFun_stage2, models(m).x0, models(m).lb, models(m).ub, opts);
 
             p_opt = [hw_opt(:); pp_opt(:)];
@@ -429,11 +418,11 @@ best_fun = best.fun;
 for k = 1:nFiles
     ds = datasets(k);
     predF_front = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
-        best.h_wF(1), best.h_wF(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, ds.TambK);
+        best.h_wF(1), best.h_wF(2), best_fun, best.padfrac_params, ds.front_axle_regen_power, ds.Edrag, ...
+        ds.omega_all, VehicleMass, RotorMass_front, RotorArea_front, I, ds.TambK, VP);
     predF_rear = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
-        best.h_wR(1), best.h_wR(2), best_fun, best.padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, ds.TambK);
+        best.h_wR(1), best.h_wR(2), best_fun, best.padfrac_params, ds.rear_axle_regen_power, ds.Edrag, ...
+        ds.omega_all, VehicleMass, RotorMass_rear, RotorArea_rear, I, ds.TambK, VP);
 
     figure('Name', sprintf('Best Fit - %s', ds.name));
     subplot(2,1,1);
@@ -584,64 +573,73 @@ end
 end
 
 
-function derived = compute_derived_quantities(parsed, gearParams, aeroParams)
+function derived = compute_derived_quantities(parsed, VP)
 % Reconstructs everything brake_temp_sim needs: cleaned velocity,
 % front/rear pressure (psi), front/rear rotor temp (degF), Tbias_brake,
-% aero drag force, total regen power, and per-corner wheel omega.
+% aero drag force, per-axle regen power, and per-corner wheel omega.
+% P is the centralized parameter struct from loadVehicleParams().
 
 velx = parsed.velx;
-velx(abs(velx) > gearParams.velx_threshold) = 0;
+velx(abs(velx) > VP.velx_threshold) = 0;
 velx(isnan(velx)) = 0;
 velx(velx < 0)    = 0;
 speed_mph = velx * 2.23694;
 
-frontpressure = max(0.924 * parsed.frontpressure_adc - 332.64,  0);  % psi
-rearpressure  = max(0.924 * parsed.rearpressure_adc  - 376.068, 0);  % psi
+frontpressure = max(VP.press_front_slope * parsed.frontpressure_adc - VP.press_front_offset, 0);  % psi
+rearpressure  = max(VP.press_rear_slope  * parsed.rearpressure_adc  - VP.press_rear_offset,  0);  % psi
 
-fr_temp_C = 0.246 * (parsed.fr_temp_adc - 406);
-rr_temp_C = 0.246 * (parsed.rr_temp_adc - 406);
+fr_temp_C = VP.temp_adc_slope * (parsed.fr_temp_adc - VP.temp_adc_offset);
+rr_temp_C = VP.temp_adc_slope * (parsed.rr_temp_adc - VP.temp_adc_offset);
 fr_temp_F = fr_temp_C * (9/5) + 32;
 rr_temp_F = rr_temp_C * (9/5) + 32;
 
 fl_Tmotor = parsed.fl_Tmotor_Mn / 100 * 9.8;  fr_Tmotor = parsed.fr_Tmotor_Mn / 100 * 9.8;
 rl_Tmotor = parsed.rl_Tmotor_Mn / 100 * 9.8;  rr_Tmotor = parsed.rr_Tmotor_Mn / 100 * 9.8;
 
-fl_vwheel = parsed.fl_vmotor / gearParams.gear_ratio;  fr_vwheel = parsed.fr_vmotor / gearParams.gear_ratio;
-rl_vwheel = parsed.rl_vmotor / gearParams.gear_ratio;  rr_vwheel = parsed.rr_vmotor / gearParams.gear_ratio;
+fl_vwheel = parsed.fl_vmotor / VP.gear_ratio;  fr_vwheel = parsed.fr_vmotor / VP.gear_ratio;
+rl_vwheel = parsed.rl_vmotor / VP.gear_ratio;  rr_vwheel = parsed.rr_vmotor / VP.gear_ratio;
 
 fl_omega_wheel = fl_vwheel * (2*pi/60);  fr_omega_wheel = fr_vwheel * (2*pi/60);
 rl_omega_wheel = rl_vwheel * (2*pi/60);  rr_omega_wheel = rr_vwheel * (2*pi/60);
 fl_omega_motor = parsed.fl_vmotor * (2*pi/60);  fr_omega_motor = parsed.fr_vmotor * (2*pi/60);
 rl_omega_motor = parsed.rl_vmotor * (2*pi/60);  rr_omega_motor = parsed.rr_vmotor * (2*pi/60);
 
-% Clamp forces & mu-based brake torque, needed only to reconstruct Tbias_brake
-front_piston_area = aeroParams.front_piston_count * pi * (aeroParams.front_piston_dia/2)^2;
-rear_piston_area  = aeroParams.rear_piston_count  * pi * (aeroParams.rear_piston_dia/2)^2;
-front_rotor_radius = aeroParams.front_rotor_dia / 2;
-rear_rotor_radius  = aeroParams.rear_rotor_dia  / 2;
+% Clamp forces & mu-based brake torque, needed only to reconstruct
+% Tbias_brake. Clamp force uses the SINGLE-SIDE piston area (loadVehicleParams
+% halves the per-caliper piston count for opposed calipers) - the caliper is
+% a closed force loop, so the far side reacts the load rather than adding to
+% it. The factor of 2 below is the two friction FACES, not the two sides'
+% pistons. Lever arm is the documented MEAN PAD RADIUS, not the rotor OD.
+% NOTE: both of these cancel out of Tbias_brake (it is a ratio and every
+% term carries the same factor), so they do not change this script's fit -
+% they matter for absolute torque, which padSpecificPower.m consumes.
+front_piston_area_side = VP.front_piston_area_per_side;
+rear_piston_area_side  = VP.rear_piston_area_per_side;
+front_pad_radius = VP.front_pad_mean_radius;
+rear_pad_radius  = VP.rear_pad_mean_radius;
 
-fl_clamp_force = (frontpressure * 6895) .* front_piston_area;
-fr_clamp_force = (frontpressure * 6895) .* front_piston_area;
-rl_clamp_force = (rearpressure  * 6895) .* rear_piston_area;
-rr_clamp_force = (rearpressure  * 6895) .* rear_piston_area;
+fl_clamp_force = (frontpressure * 6895) .* front_piston_area_side;
+fr_clamp_force = (frontpressure * 6895) .* front_piston_area_side;
+rl_clamp_force = (rearpressure  * 6895) .* rear_piston_area_side;
+rr_clamp_force = (rearpressure  * 6895) .* rear_piston_area_side;
 
-mu_front = interp1(aeroParams.mu_temp_table, aeroParams.mu_table, fr_temp_F, 'linear', 'extrap');
-mu_front = max(min(mu_front, max(aeroParams.mu_table)), min(aeroParams.mu_table));
-mu_rear  = interp1(aeroParams.mu_temp_table, aeroParams.mu_table, rr_temp_F, 'linear', 'extrap');
-mu_rear  = max(min(mu_rear,  max(aeroParams.mu_table)), min(aeroParams.mu_table));
+mu_front = interp1(VP.mu_temp_table, VP.mu_table, fr_temp_F, 'linear', 'extrap');
+mu_front = max(min(mu_front, max(VP.mu_table)), min(VP.mu_table));
+mu_rear  = interp1(VP.mu_temp_table, VP.mu_table, rr_temp_F, 'linear', 'extrap');
+mu_rear  = max(min(mu_rear,  max(VP.mu_table)), min(VP.mu_table));
 
-fl_Tbrake = -2 * mu_front .* fl_clamp_force .* front_rotor_radius;
-fr_Tbrake = -2 * mu_front .* fr_clamp_force .* front_rotor_radius;
-rl_Tbrake = -2 * mu_rear  .* rl_clamp_force .* rear_rotor_radius;
-rr_Tbrake = -2 * mu_rear  .* rr_clamp_force .* rear_rotor_radius;
+fl_Tbrake = -2 * mu_front .* fl_clamp_force .* front_pad_radius;
+fr_Tbrake = -2 * mu_front .* fr_clamp_force .* front_pad_radius;
+rl_Tbrake = -2 * mu_rear  .* rl_clamp_force .* rear_pad_radius;
+rr_Tbrake = -2 * mu_rear  .* rr_clamp_force .* rear_pad_radius;
 ftot_Tbrake = fl_Tbrake + fr_Tbrake;
 rtot_Tbrake = rl_Tbrake + rr_Tbrake;
 Tbias_brake = ftot_Tbrake ./ (rtot_Tbrake + ftot_Tbrake);
 Tbias_brake(isnan(Tbias_brake)) = 0;
 
 % Aero drag (DRS-dependent)
-F_aero_open   = aeroParams.aero_open_a   * speed_mph.^2 + aeroParams.aero_open_b   * speed_mph + aeroParams.aero_open_c;
-F_aero_closed = aeroParams.aero_closed_a * speed_mph.^2 + aeroParams.aero_closed_b * speed_mph + aeroParams.aero_closed_c;
+F_aero_open   = VP.aero_open_a   * speed_mph.^2 + VP.aero_open_b   * speed_mph + VP.aero_open_c;
+F_aero_closed = VP.aero_closed_a * speed_mph.^2 + VP.aero_closed_b * speed_mph + VP.aero_closed_c;
 F_aero = F_aero_open .* double(parsed.drs_state == 1) + F_aero_closed .* double(parsed.drs_state == 0);
 F_aero = max(F_aero, 0);
 
@@ -651,7 +649,6 @@ fl_regen_power = min(fl_Tmotor .* fl_omega_motor, 0) .* double(decelerating_idx)
 fr_regen_power = min(fr_Tmotor .* fr_omega_motor, 0) .* double(decelerating_idx);
 rl_regen_power = min(rl_Tmotor .* rl_omega_motor, 0) .* double(decelerating_idx);
 rr_regen_power = min(rr_Tmotor .* rr_omega_motor, 0) .* double(decelerating_idx);
-total_regen_power = fl_regen_power + fr_regen_power + rl_regen_power + rr_regen_power;
 
 derived.velx              = velx;
 derived.frontpressure     = frontpressure;
@@ -660,7 +657,12 @@ derived.fr_temp_F         = fr_temp_F;
 derived.rr_temp_F         = rr_temp_F;
 derived.Tbias_brake       = Tbias_brake;
 derived.F_aero            = F_aero;
-derived.total_regen_power = total_regen_power;
+% Regen is measured PER CORNER, so it is kept per axle rather than pooled to
+% a single vehicle-level total. Pooling it and subtracting before the
+% Tbias/corner split let front regen offset REAR rotor heat in proportion to
+% brake bias, which is not physical.
+derived.front_axle_regen_power = fl_regen_power + fr_regen_power;
+derived.rear_axle_regen_power  = rl_regen_power + rr_regen_power;
 derived.fl_omega_wheel    = fl_omega_wheel;
 derived.fr_omega_wheel    = fr_omega_wheel;
 derived.rl_omega_wheel    = rl_omega_wheel;
@@ -684,7 +686,7 @@ end
 
 function residual = brake_temp_residuals(p, padfrac_fun, datasets, ...
     VehicleMass, RotorMass_front, RotorMass_rear, RotorArea_front, RotorArea_rear, ...
-    I, WheelR, residualMode)
+    I, VP, residualMode)
 % Pools front + rear residuals across ALL datasets into one vector for
 % lsqnonlin. x1,b1 (h_w) and the PadFrac params are shared/global across
 % every dataset and both corners - only Tbias flips between front/rear.
@@ -704,12 +706,12 @@ for k = 1:numel(datasets)
     ds = datasets(k);
 
     [predF_front, activeFront] = run_sim_opt(ds.t, ds.velx, ds.frontpressure, ds.fr_temp_F, ds.Tbias_brake, ...
-        x1f_p, b1f_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.fl_omega_wheel, ds.fr_omega_wheel, VehicleMass, RotorMass_front, RotorArea_front, I, WheelR, ds.TambK);
+        x1f_p, b1f_p, padfrac_fun, padfrac_params, ds.front_axle_regen_power, ds.Edrag, ...
+        ds.omega_all, VehicleMass, RotorMass_front, RotorArea_front, I, ds.TambK, VP);
 
     [predF_rear, activeRear] = run_sim_opt(ds.t, ds.velx, ds.rearpressure, ds.rr_temp_F, 1 - ds.Tbias_brake, ...
-        x1r_p, b1r_p, padfrac_fun, padfrac_params, ds.total_regen_power, ds.Edrag, ...
-        ds.rl_omega_wheel, ds.rr_omega_wheel, VehicleMass, RotorMass_rear, RotorArea_rear, I, WheelR, ds.TambK);
+        x1r_p, b1r_p, padfrac_fun, padfrac_params, ds.rear_axle_regen_power, ds.Edrag, ...
+        ds.omega_all, VehicleMass, RotorMass_rear, RotorArea_rear, I, ds.TambK, VP);
 
     residFront = predF_front(:) - ds.fr_temp_F(:);
     residRear  = predF_rear(:) - ds.rr_temp_F(:);
@@ -727,11 +729,19 @@ end
 
 
 function [RotorTempArrayF, activeMask] = run_sim_opt(t, velx, BrakePress, brakeTempArray, Tbias, ...
-    x1_p, b1_p, padfrac_fun, padfrac_params, total_regen_power, Edrag, ...
-    omega_wheel_L, omega_wheel_R, VehicleMass, RotorMass, RotorArea, I, WheelR, TambK) %#ok<INUSD>
+    x1_p, b1_p, padfrac_fun, padfrac_params, axle_regen_power, Edrag, ...
+    omega_all, VehicleMass, RotorMass, RotorArea, I, TambK, VP)
 % Same physics as run_sim() in brake_temp_sim.m, except PadFrac is now
 % evaluated by an arbitrary function of (rotor temp [K], applied
 % pressure [psi]) instead of a hardcoded linear-in-T formula.
+%
+% BASIS: every sizing input is per single component. The energy chain is
+%   whole vehicle -> x Tbias -> one axle -> x0.5 -> ONE CORNER = ONE ROTOR,
+% so the corner energy divides by one RotorMass directly.
+%
+% `omega_all` is a 4-column [fl fr rl rr] matrix of per-corner wheel speeds,
+% used to sum rotational KE strictly per corner. `axle_regen_power` is THIS
+% axle's regen only, so regen is attributed to the corners that produced it.
 %
 % activeMask(i) is true where step i took the active-braking branch (i.e.
 % PadFrac actually mattered for that step) and false where it took the
@@ -741,7 +751,8 @@ function [RotorTempArrayF, activeMask] = run_sim_opt(t, velx, BrakePress, brakeT
 RotorTempArrayK = zeros(size(t));
 RotorTempArrayK(1) = (brakeTempArray(1) - 32) * (5/9) + 273.15;
 activeMask = false(size(t));
-min_pressure = 5;  % psi, threshold to consider brakes applied
+min_pressure = VP.min_pressure;   % psi, threshold to consider brakes applied
+corner_split = 0.5;              % one axle -> ONE corner (= one rotor)
 
 for i = 2:length(t)
     prevSpeed = velx(i-1);
@@ -766,17 +777,21 @@ for i = 2:length(t)
     if DS < 0 && BrakePress(i) > min_pressure
         activeMask(i) = true;
         Energy1 = 0.5 * VehicleMass * (prevSpeed^2 - newSpeed^2);
-        omegaP  = (omega_wheel_L(i-1) + omega_wheel_R(i-1)) / 2;
-        omegaN  = (omega_wheel_L(i)   + omega_wheel_R(i))   / 2;
-        Energy2 = 4 * (0.5 * I * (omegaP^2 - omegaN^2));
+        % Rotational KE summed strictly PER CORNER: I is one corner's
+        % inertia, so each corner contributes using its OWN omega.
+        Energy2 = sum(0.5 * I * (omega_all(i-1,:).^2 - omega_all(i,:).^2));
         Energy  = Energy1 + Energy2;
 
-        regen_energy    = abs(total_regen_power(i)) * tbrake;
-        friction_energy = max(Energy - regen_energy, 0);
         AeroFrac  = min(Edrag(i) / max(Energy, 1), 1);
-        BrakeFrac = 0.82;
 
-        CorrectedEnergy    = friction_energy * 0.5 * Tbias(i) * (1 - AeroFrac) * (1 - PadFrac) * BrakeFrac * 0.8;
+        % Split the vehicle's KE loss down to THIS CORNER first, then remove
+        % aero and this corner's own regen (previously regen was pooled
+        % across all four corners and subtracted before the split).
+        Energy_corner   = Energy * Tbias(i) * corner_split * (1 - AeroFrac);
+        regen_energy    = abs(axle_regen_power(i)) * tbrake * corner_split;
+        friction_energy = max(Energy_corner - regen_energy, 0);
+
+        CorrectedEnergy    = friction_energy * (1 - PadFrac) * VP.BrakeFrac * VP.CalibrationFactor;
         deltaTK             = CorrectedEnergy / (RotorMass * SpecHeat);
         RotorTempArrayK(i)  = deltaTK + prevTemp;
 
