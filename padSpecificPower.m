@@ -310,34 +310,34 @@ PadFrac_ideal = xi_pad_mid / (xi_pad_mid + xi_rotor);
 % NOTE: coefficients below carry ~5 significant figures (the precision
 % BrakeCoeffOptimizer prints per model). Re-run it if you need more.
 padFracModels(1).name = 'Linear in T only';
-padFracModels(1).x1f = 2.3669; padFracModels(1).b1f = 21.1331;
-padFracModels(1).x1r = 3.6414; padFracModels(1).b1r = 29.3594;
-padFracModels(1).fun = @(T,P) 0.0004609.*T + 0.13389;
+padFracModels(1).x1f = 2.366902; padFracModels(1).b1f = 21.133072;
+padFracModels(1).x1r = 3.641386; padFracModels(1).b1r = 29.359405;
+padFracModels(1).fun = @(T,P) 0.00046090397.*T + 0.13389237;
 
-padFracModels(2).name = 'Linear, independent T and P';
-padFracModels(2).x1f = 2.3669; padFracModels(2).b1f = 21.1331;
-padFracModels(2).x1r = 3.6414; padFracModels(2).b1r = 29.3594;
-padFracModels(2).fun = @(T,P) 0.00046091.*T + 2.3374e-14.*P + 0.13389;
-
-padFracModels(3).name = 'Linear with T*P interaction';
-padFracModels(3).x1f = 0.2886; padFracModels(3).b1f = 23.6252;
-padFracModels(3).x1r = 1.7692; padFracModels(3).b1r = 30.9199;
-padFracModels(3).fun = @(T,P) 0.001538.*T + 7.2797e-13.*P + (-9.3245e-07).*T.*P + (-0.057921);
-
-padFracModels(4).name = 'Quadratic in T, linear in P';
-padFracModels(4).x1f = 2.4898; padFracModels(4).b1f = 21.4565;
-padFracModels(4).x1r = 3.9885; padFracModels(4).b1r = 26.7070;
-padFracModels(4).fun = @(T,P) -0.0022399.*T + 2.2497e-06.*T.^2 + 2.3373e-14.*P + 0.8988;
-
-padFracModels(5).name = 'Anchored to effusivity-based ideal';
-padFracModels(5).x1f = 3.7213; padFracModels(5).b1f = 22.6092;
-padFracModels(5).x1r = 4.9567; padFracModels(5).b1r = 30.1357;
-padFracModels(5).fun = @(T,P) PadFrac_ideal + 0.13218.*(T-Tmid_K)/dT + (-0.15).*(P-Pmid)/dP + 0.05;
-
-padFracModels(6).name = 'Saturating logistic in T,P';
-padFracModels(6).x1f = 1.7024; padFracModels(6).b1f = 23.0513;
-padFracModels(6).x1r = 2.6705; padFracModels(6).b1r = 30.5203;
-padFracModels(6).fun = @(T,P) 0.58619 ./ (1 + exp(-(4.1327.*(T-Tmid_K)/dT + (-5.2435).*(P-Pmid)/dP + 0.45673)));
+% padFracModels(2).name = 'Linear, independent T and P';
+% padFracModels(2).x1f = 2.3669; padFracModels(2).b1f = 21.1331;
+% padFracModels(2).x1r = 3.6414; padFracModels(2).b1r = 29.3594;
+% padFracModels(2).fun = @(T,P) 0.00046091.*T + 2.3374e-14.*P + 0.13389;
+% 
+% padFracModels(3).name = 'Linear with T*P interaction';
+% padFracModels(3).x1f = 0.2886; padFracModels(3).b1f = 23.6252;
+% padFracModels(3).x1r = 1.7692; padFracModels(3).b1r = 30.9199;
+% padFracModels(3).fun = @(T,P) 0.001538.*T + 7.2797e-13.*P + (-9.3245e-07).*T.*P + (-0.057921);
+% 
+% padFracModels(4).name = 'Quadratic in T, linear in P';
+% padFracModels(4).x1f = 2.4898; padFracModels(4).b1f = 21.4565;
+% padFracModels(4).x1r = 3.9885; padFracModels(4).b1r = 26.7070;
+% padFracModels(4).fun = @(T,P) -0.0022399.*T + 2.2497e-06.*T.^2 + 2.3373e-14.*P + 0.8988;
+% 
+% padFracModels(5).name = 'Anchored to effusivity-based ideal';
+% padFracModels(5).x1f = 3.7213; padFracModels(5).b1f = 22.6092;
+% padFracModels(5).x1r = 4.9567; padFracModels(5).b1r = 30.1357;
+% padFracModels(5).fun = @(T,P) PadFrac_ideal + 0.13218.*(T-Tmid_K)/dT + (-0.15).*(P-Pmid)/dP + 0.05;
+% 
+% padFracModels(6).name = 'Saturating logistic in T,P';
+% padFracModels(6).x1f = 1.7024; padFracModels(6).b1f = 23.0513;
+% padFracModels(6).x1r = 2.6705; padFracModels(6).b1r = 30.5203;
+% padFracModels(6).fun = @(T,P) 0.58619 ./ (1 + exp(-(4.1327.*(T-Tmid_K)/dT + (-5.2435).*(P-Pmid)/dP + 0.45673)));
 
 C = struct('VehicleMass', VehicleMass, 'RotorMass_front', RotorMass_front, 'RotorMass_rear', RotorMass_rear, ...
     'RotorArea_front', RotorArea_front, 'RotorArea_rear', RotorArea_rear, 'I', I, ...

@@ -258,59 +258,59 @@ models(1).lb   = [-x2_bound, -b2_bound];
 models(1).ub   = [ x2_bound,  b2_bound];
 models(1).x0   = [x2_seed, b2_seed];
 
-models(2).name = 'Linear, independent T and P';
-models(2).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3);
-% p(2) (direct pressure term) is bounded >= 0: thermal-contact-conductance
-% literature (Cooper-Mikic-Yovanovich) shows contact conductance can only
-% increase or stay flat with clamping pressure as asperities flatten, never
-% decrease - a negative pressure sensitivity has no physical basis, and
-% allowing it is what let this model collapse PadFrac to zero at high P.
-models(2).lb   = [-x2_bound, 0, -b2_bound];
-models(2).ub   = [ x2_bound, x3_bound, b2_bound];
-models(2).x0   = [x2_seed, 0, b2_seed];
-
-models(3).name = 'Linear with T*P interaction';
-models(3).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3).*T.*P + p(4);
-% p(2) (direct P term) non-negative for the same reason as model 2. The
-% interaction term p(3) is left unconstrained in sign since there isn't a
-% clear physical prior for how P's effect should change with T.
-models(3).lb   = [-x2_bound, 0, -x4_bound, -b2_bound];
-models(3).ub   = [ x2_bound, x3_bound, x4_bound,  b2_bound];
-models(3).x0   = [x2_seed, 0, 0, b2_seed];
-
-models(4).name = 'Quadratic in T, linear in P';
-quad_bound = x2_bound / dT;
-models(4).fun  = @(T, P, p) p(1).*T + p(2).*T.^2 + p(3).*P + p(4);
-models(4).lb   = [-x2_bound, -quad_bound, 0, -b2_bound];
-models(4).ub   = [ x2_bound,  quad_bound, x3_bound,  b2_bound];
-models(4).x0   = [x2_seed, 0, 0, b2_seed];
-
-models(5).name = 'Anchored to effusivity-based ideal (small T,P correction)';
-% PadFrac = PadFrac_ideal + a small correction. Unlike models 1-4, this
-% model doesn't fit the partition ratio from scratch - it stays tethered
-% to the physically-computed anchor and only lets the optimizer nudge it
-% within a tight band, which is the "decouple from the anchor" approach
-% suggested by the effusivity theory above. p(1),p(2) are the correction's
-% full swing across the observed T/P range; p(3) is a small constant offset.
-anchor_correction_bound = 0.15;   % max additional swing away from the anchor
-models(5).fun  = @(T, P, p) PadFrac_ideal + p(1).*(T-Tmid_K)/dT + p(2).*(P-Pmid)/dP + p(3);
-models(5).lb   = [-anchor_correction_bound, -anchor_correction_bound, -0.05];
-models(5).ub   = [ anchor_correction_bound,  anchor_correction_bound,  0.05];
-models(5).x0   = [0, 0, 0];
-
-models(6).name = 'Saturating logistic in T,P (bounded, cannot collapse to 0)';
-% PadFrac = PadMax / (1 + exp(-(slope terms))). This form is bounded in
-% [0, PadMax] by construction for ANY coefficient values - it cannot be
-% driven to 0 or blow up by extrapolating past the well-sampled pressure
-% range the way an unbounded linear/polynomial term can. PadMax is itself
-% fit, with bounds informed by the effusivity-based anchor above (given
-% generous headroom since the anchor is a rough estimate).
-padmax_lb = max(0.02, PadFrac_ideal_lo * 0.5);
-padmax_ub = min(0.6,  PadFrac_ideal_hi * 2.5);
-models(6).fun  = @(T, P, p) p(1) ./ (1 + exp(-(p(2).*(T-Tmid_K)/dT + p(3).*(P-Pmid)/dP + p(4))));
-models(6).lb   = [padmax_lb, -15, -15, -10];
-models(6).ub   = [padmax_ub,  15,  15,  10];
-models(6).x0   = [min(max(PadFrac_ideal*1.3, padmax_lb), padmax_ub), 0, 0, 0];
+% models(2).name = 'Linear, independent T and P';
+% models(2).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3);
+% % p(2) (direct pressure term) is bounded >= 0: thermal-contact-conductance
+% % literature (Cooper-Mikic-Yovanovich) shows contact conductance can only
+% % increase or stay flat with clamping pressure as asperities flatten, never
+% % decrease - a negative pressure sensitivity has no physical basis, and
+% % allowing it is what let this model collapse PadFrac to zero at high P.
+% models(2).lb   = [-x2_bound, 0, -b2_bound];
+% models(2).ub   = [ x2_bound, x3_bound, b2_bound];
+% models(2).x0   = [x2_seed, 0, b2_seed];
+% 
+% models(3).name = 'Linear with T*P interaction';
+% models(3).fun  = @(T, P, p) p(1).*T + p(2).*P + p(3).*T.*P + p(4);
+% % p(2) (direct P term) non-negative for the same reason as model 2. The
+% % interaction term p(3) is left unconstrained in sign since there isn't a
+% % clear physical prior for how P's effect should change with T.
+% models(3).lb   = [-x2_bound, 0, -x4_bound, -b2_bound];
+% models(3).ub   = [ x2_bound, x3_bound, x4_bound,  b2_bound];
+% models(3).x0   = [x2_seed, 0, 0, b2_seed];
+% 
+% models(4).name = 'Quadratic in T, linear in P';
+% quad_bound = x2_bound / dT;
+% models(4).fun  = @(T, P, p) p(1).*T + p(2).*T.^2 + p(3).*P + p(4);
+% models(4).lb   = [-x2_bound, -quad_bound, 0, -b2_bound];
+% models(4).ub   = [ x2_bound,  quad_bound, x3_bound,  b2_bound];
+% models(4).x0   = [x2_seed, 0, 0, b2_seed];
+% 
+% models(5).name = 'Anchored to effusivity-based ideal (small T,P correction)';
+% % PadFrac = PadFrac_ideal + a small correction. Unlike models 1-4, this
+% % model doesn't fit the partition ratio from scratch - it stays tethered
+% % to the physically-computed anchor and only lets the optimizer nudge it
+% % within a tight band, which is the "decouple from the anchor" approach
+% % suggested by the effusivity theory above. p(1),p(2) are the correction's
+% % full swing across the observed T/P range; p(3) is a small constant offset.
+% anchor_correction_bound = 0.15;   % max additional swing away from the anchor
+% models(5).fun  = @(T, P, p) PadFrac_ideal + p(1).*(T-Tmid_K)/dT + p(2).*(P-Pmid)/dP + p(3);
+% models(5).lb   = [-anchor_correction_bound, -anchor_correction_bound, -0.05];
+% models(5).ub   = [ anchor_correction_bound,  anchor_correction_bound,  0.05];
+% models(5).x0   = [0, 0, 0];
+% 
+% models(6).name = 'Saturating logistic in T,P (bounded, cannot collapse to 0)';
+% % PadFrac = PadMax / (1 + exp(-(slope terms))). This form is bounded in
+% % [0, PadMax] by construction for ANY coefficient values - it cannot be
+% % driven to 0 or blow up by extrapolating past the well-sampled pressure
+% % range the way an unbounded linear/polynomial term can. PadMax is itself
+% % fit, with bounds informed by the effusivity-based anchor above (given
+% % generous headroom since the anchor is a rough estimate).
+% padmax_lb = max(0.02, PadFrac_ideal_lo * 0.5);
+% padmax_ub = min(0.6,  PadFrac_ideal_hi * 2.5);
+% models(6).fun  = @(T, P, p) p(1) ./ (1 + exp(-(p(2).*(T-Tmid_K)/dT + p(3).*(P-Pmid)/dP + p(4))));
+% models(6).lb   = [padmax_lb, -15, -15, -10];
+% models(6).ub   = [padmax_ub,  15,  15,  10];
+% models(6).x0   = [min(max(PadFrac_ideal*1.3, padmax_lb), padmax_ub), 0, 0, 0];
 
 %% ================== RUN OPTIMIZATION FOR EACH MODEL ==================
 opts = optimoptions('lsqnonlin', 'Display', 'iter', 'MaxFunctionEvaluations', 500, ...

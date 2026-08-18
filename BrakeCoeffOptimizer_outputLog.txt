@@ -1,4 +1,16 @@
 ================ FINAL FIT (best model) ================
+Date and time 17-Aug-2026 22:51:00
+x1f = 2.366902;   % h_wF slope
+b1f = 21.133072;   % h_wF intercept
+x1r = 3.641386;   % h_wR slope
+b1r = 29.359405;   % h_wR intercept
+padFrac function: @(T,P,p)p(1).*T+p(2)
+PadFrac params (Linear in T only (current baseline) [joint]):
+  p(1) = 0.00046090397
+  p(2) = 0.13389237
+OK TO USE
+
+================ FINAL FIT (best model) ================
 x1f = 1.087479;   % h_wF slope
 b1f = 32.559219;   % h_wF intercept
 x1r = 3.085466;   % h_wR slope
