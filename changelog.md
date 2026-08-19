@@ -1,3 +1,39 @@
+### 8/18/2026 (later)
+
+Add regen fraction vs charge current limit
+
+
+
+\- Add a figure sweeping the charge current limit (10-70 A) and plotting the
+
+&#x20; modeled regen share of dissipated energy for each drive type, with the
+
+&#x20; measured share at the recorded 35 A limit overlaid for comparison. The
+
+&#x20; denominator is held fixed across the sweep: raising the limit moves energy
+
+&#x20; from the friction brakes to the motors, it does not change how much energy
+
+&#x20; the lap required the car to shed
+
+\- Change regen energy vs deceleration rate to regen SHARE vs deceleration
+
+&#x20; rate. A harder stop sheds more of everything, so absolute regen energy
+
+&#x20; against decel rate mostly restated that the stop was big; the share shows
+
+&#x20; how well regen keeps up as braking gets harder. Event duration keeps
+
+&#x20; absolute energy, where the magnitude is the point
+
+\- Factor the regen torque model into predict\_regen\_power so the swept curve
+
+&#x20; and the single-limit console figure cannot drift apart (verified equal to
+
+&#x20; 5 decimal places at the recorded limit)
+
+
+
 ### 8/18/2026
 
 Add regenerative braking energy contribution analysis

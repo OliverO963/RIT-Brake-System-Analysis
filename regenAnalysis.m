@@ -38,9 +38,11 @@
 %       current (files that have it), one colored by regen power (files
 %       that do not)
 %    6) Theoretical max regen torque vs speed at several current limits
-%    7) Cumulative braking energy breakdown, one pie per drive type
-%    8) Per-event regen / friction / aero energy distributions per drive type
-%    9) Regen energy vs deceleration rate, and vs event duration
+%    7) Modeled regen energy fraction vs charge current limit, one curve
+%       per drive type, against the measured fraction at the recorded limit
+%    8) Cumulative braking energy breakdown, one pie per drive type
+%    9) Per-event regen / friction / aero energy distributions per drive type
+%   10) Regen share vs deceleration rate, and regen energy vs event duration
 %
 %  Rotor temperature is still USED (mu vs temperature drives the friction
 %  brake torque) but no temperature output is produced - that lives in
@@ -75,6 +77,11 @@ torque_limit_total_wheel = VP.torque_limit_total_MN / 100 * 9.8 * gear_ratio;  %
 % scalar-only, so it stays here.
 current_limits = [30, 35, 40];   % A
 limit_colors   = {'r-', 'g-', 'b-'};
+
+% Finer grid for the regen-fraction-vs-current-limit figure, which needs a
+% curve rather than three discrete cases. Spans well below and above the
+% recorded limit so the shape of the return on raising it is visible.
+current_limit_sweep = 10:2.5:70;   % A
 
 %% ================== REGEN-PRESENCE SETTINGS ==================
 % Which samples count as "regenerating", and which whole datasets get
@@ -124,6 +131,13 @@ speed_plot           = linspace(1, 80, 500);  % mph, x-grid for theoretical curv
 
 driveCats   = {'Autocross', 'Endurance', 'Other/Misc'};
 driveColors = [0.85 0.33 0.10; 0.00 0.45 0.74; 0.47 0.67 0.19];
+
+% Constants the regen-torque model needs, bundled once so predict_regen_power
+% takes the same inputs everywhere it is called.
+RC = struct('current_limit_actual', current_limit_actual, 'WheelR', WheelR, ...
+    'regen_power_limit', regen_power_limit, 'regen_max_curve_a', regen_max_curve_a, ...
+    'regen_max_curve_b', regen_max_curve_b, 'regen_efficiency', regen_efficiency, ...
+    'torque_limit_total_wheel', torque_limit_total_wheel);
 
 %% ================== SELECT DATASETS ==================
 [files, path] = uigetfile('*.txt', 'Select driving dataset file(s)', 'MultiSelect', 'on');
@@ -230,20 +244,11 @@ for k = 1:nFiles
         continue
     end
 
-    % ---- Predicted regen at the actual current limit ----
-    % Identical model to BrakeDataAnalysis.m: the most restrictive of the
-    % current-dependent max-torque curve, the controller power limit, and
-    % the absolute torque limit, applied over the regen samples.
-    omega_from_speed        = max(derived.speed_mph * 0.44704 / WheelR, 0.1);  % rad/s
-    torque_from_power_limit = regen_power_limit ./ omega_from_speed;           % Nm
-    max_regen_torque        = regen_max_curve_a * derived.speed_mph.^(regen_max_curve_b) * regen_efficiency;
-    max_regen_torque(derived.speed_mph < 1) = 0;
-    effective_max_torque    = min(min(max_regen_torque, torque_from_power_limit), torque_limit_total_wheel);
-    predicted_regen_torque  = -effective_max_torque .* double(regen_idx);
-    predicted_regen_power   = (predicted_regen_torque .* derived.Tbias_regen / 2)     .* derived.fl_omega_wheel + ...
-                              (predicted_regen_torque .* derived.Tbias_regen / 2)     .* derived.fr_omega_wheel + ...
-                              (predicted_regen_torque .* (1-derived.Tbias_regen) / 2) .* derived.rl_omega_wheel + ...
-                              (predicted_regen_torque .* (1-derived.Tbias_regen) / 2) .* derived.rr_omega_wheel;
+    % ---- Predicted regen, at the actual limit and across the sweep ----
+    % One implementation (predict_regen_power) serves both, so the number
+    % reported in the console and the curve drawn in the fraction-vs-limit
+    % figure cannot drift apart.
+    predicted_regen_power = predict_regen_power(derived, regen_idx, current_limit_actual, RC);
 
     % ---- Per-dataset energy totals (J) ----
     S = struct();
@@ -252,6 +257,14 @@ for k = 1:nFiles
     S.aero_decel_J = sum(P_aero .* double(decel_idx) .* dt);
     S.aero_regen_J = sum(P_aero .* double(regen_idx) .* dt);
     S.pred_regen_J = sum(abs(predicted_regen_power .* dt));
+    % Same model swept across candidate charge current limits. Kept as a
+    % per-dataset row vector so it pools by drive type the same way every
+    % other energy total does.
+    S.pred_regen_sweep_J = zeros(1, numel(current_limit_sweep));
+    for i = 1:numel(current_limit_sweep)
+        S.pred_regen_sweep_J(i) = ...
+            sum(abs(predict_regen_power(derived, regen_idx, current_limit_sweep(i), RC) .* dt));
+    end
     S.aero_open_J       = sum(derived.F_aero_open   .* max(derived.velx, 0) .* double(derived.drs_state == 1) .* dt);
     S.aero_closed_J     = sum(derived.F_aero_closed .* max(derived.velx, 0) .* double(derived.drs_state == 0) .* dt);
     S.aero_all_open_J   = sum(derived.F_aero_open   .* max(derived.velx, 0) .* dt);
@@ -482,7 +495,53 @@ title('Theoretical Max Regen Torque vs Speed at Different Current Limits');
 legend('Location', 'best'); grid on;
 ylim([0, torque_limit_total_wheel * 1.2]);
 
-%% ---- Figure 7: Cumulative braking energy breakdown by drive type ----
+%% ---- Figure 7: Regen energy fraction vs charge current limit ----
+% What share of the energy dissipated could regen have recovered, had the
+% charge current limit been set differently?
+%
+% The denominator is the MEASURED dissipated energy (regen + friction +
+% aero) and is held fixed across the sweep, because the energy a given lap
+% requires the car to shed is set by the driving, not by the current limit.
+% Raising the limit moves energy from the friction brakes to the motors; it
+% does not change how much there was to shed.
+%
+% The filled markers are the actual measured regen fraction at the recorded
+% limit. The vertical distance between a marker and its own curve is the
+% regen model's error for that drive type - read the curve's SHAPE (the
+% return on raising the limit) with more confidence than its absolute level.
+figure('Name', 'Regen Energy Fraction vs Charge Current Limit');
+hold on; grid on;
+
+measX = []; measY = []; measC = [];
+for c = 1:numel(driveCats)
+    memberIdx = strcmp({datasets.driveType}, driveCats{c});
+    if ~any(memberIdx)
+        continue
+    end
+    Sc = sum_summaries([datasets(memberIdx).summary]);
+    dissipated_J = Sc.mech_J + Sc.regen_J + Sc.aero_decel_J;
+
+    plot(current_limit_sweep, 100 * Sc.pred_regen_sweep_J / max(dissipated_J, eps), ...
+        '-', 'Color', driveColors(c,:), 'LineWidth', 1.8, 'DisplayName', driveCats{c});
+
+    measX(end+1) = current_limit_actual;                                  %#ok<SAGROW>
+    measY(end+1) = 100 * Sc.regen_J / max(dissipated_J, eps);             %#ok<SAGROW>
+    measC(end+1,:) = driveColors(c,:);                                    %#ok<SAGROW>
+end
+
+if ~isempty(measX)
+    scatter(measX, measY, 70, measC, 'filled', 'MarkerEdgeColor', 'k', ...
+        'DisplayName', 'Measured at recorded limit');
+end
+xline(current_limit_actual, 'k--', sprintf('%g A as recorded', current_limit_actual), ...
+    'HandleVisibility', 'off');
+
+xlabel('Charge Current Limit (A)');
+ylabel('Regen Share of Dissipated Energy (%)');
+title('Modeled Regen Energy Fraction vs Charge Current Limit');
+legend('Location', 'best');
+
+%% ---- Figure 8: Cumulative braking energy breakdown by drive type ----
 figure('Name', 'Cumulative Braking Energy Breakdown by Drive Type');
 for c = 1:numel(driveCats)
     subplot(1, 3, c);
@@ -506,7 +565,7 @@ for c = 1:numel(driveCats)
 end
 sgtitle('Cumulative Braking Energy Breakdown');
 
-%% ---- Figure 8: Per-event energy distributions by drive type ----
+%% ---- Figure 9: Per-event energy distributions by drive type ----
 figure('Name', 'Per-Event Braking Energy Distributions by Drive Type');
 energyColors = [0.00 0.45 0.74; 0.85 0.33 0.10; 0.47 0.67 0.19];   % regen, friction, aero
 fprintf('\n\n################ PER-EVENT ENERGY DISTRIBUTIONS ################\n');
@@ -536,10 +595,21 @@ for c = 1:numel(driveCats)
 end
 sgtitle('Per-Event Energy Distributions (regen / friction / aero)');
 
-%% ---- Figure 9: Regen energy vs decel rate and event duration ----
-figure('Name', 'Regen Energy Correlations');
-corrSpecs = {'avg_decel_g', 'Average Deceleration (g)'; ...
-             'duration_s',  'Braking Event Duration (s)'};
+%% ---- Figure 10: Regen correlations vs decel rate and event duration ----
+% Deceleration rate is plotted against regen SHARE rather than regen energy:
+% a hard stop sheds more of everything, so plotting absolute regen energy
+% against it mostly restates that the stop was big. The share answers the
+% question actually being asked - how well regen keeps up as braking gets
+% harder. Duration keeps absolute energy, where the magnitude is the point.
+figure('Name', 'Regen Correlations');
+% Columns: x field, x label, y field, y label, short title (the full axis
+% labels are too long to use as titles - side by side they overlap).
+corrSpecs = {'avg_decel_g', 'Average Deceleration (g)', ...
+                'regen_frac_pct', 'Regen Share of Event Energy (%)', ...
+                'Regen Share vs Deceleration'; ...
+             'duration_s',  'Braking Event Duration (s)', ...
+                'E_regen_kJ',     'Regen Energy per Event (kJ)', ...
+                'Regen Energy vs Duration'};
 for p = 1:size(corrSpecs, 1)
     subplot(1, 2, p); hold on; grid on;
     for c = 1:numel(driveCats)
@@ -548,16 +618,17 @@ for p = 1:size(corrSpecs, 1)
             continue
         end
         ev = allEvents(mask);
-        scatter([ev.(corrSpecs{p,1})], [ev.E_regen_kJ], 20, driveColors(c,:), 'filled', ...
-            'MarkerFaceAlpha', 0.55, 'DisplayName', driveCats{c});
+        scatter([ev.(corrSpecs{p,1})], [ev.(corrSpecs{p,3})], 20, driveColors(c,:), ...
+            'filled', 'MarkerFaceAlpha', 0.55, 'DisplayName', driveCats{c});
     end
-    xlabel(corrSpecs{p,2}); ylabel('Regen Energy per Event (kJ)');
-    title(sprintf('Regen Energy vs %s', corrSpecs{p,2}), 'Interpreter', 'none');
+    xlabel(corrSpecs{p,2}); ylabel(corrSpecs{p,4});
+    title(corrSpecs{p,5}, 'Interpreter', 'none');
     if p == 1
+        ylim([0 100]);
         legend('Location', 'best');
     end
 end
-sgtitle('Per-Event Regen Energy Correlations');
+sgtitle('Per-Event Regen Correlations');
 
 
 %% ================================================================
@@ -880,11 +951,47 @@ function S = sum_summaries(Sarr)
 % Every field is an extensive quantity (joules or a count), so summing is
 % the correct pooling operation for all of them - percentages and ratios
 % are always recomputed from the pooled totals, never averaged.
+%
+% vertcat + sum(...,1) rather than sum([...]): scalar fields stack into a
+% column and collapse to a scalar as before, while the current-limit sweep
+% (a 1xN row per dataset) stacks into kxN and pools element-wise, one total
+% per swept limit. Flattening it with [Sarr.field] would silently add every
+% limit together into a single meaningless number.
 S = Sarr(1);
 flds = fieldnames(S);
 for f = 1:numel(flds)
-    S.(flds{f}) = sum([Sarr.(flds{f})]);
+    S.(flds{f}) = sum(vertcat(Sarr.(flds{f})), 1);
 end
+end
+
+
+function P = predict_regen_power(derived, regen_idx, current_limit, RC)
+% Predicted regen power (W, signed negative) at a given charge current
+% limit, using BrakeDataAnalysis.m's model: the most restrictive of the
+% current-dependent max-torque curve, the controller power limit, and the
+% absolute torque limit, applied over the samples where the car was
+% actually regenerating and split front/rear by the observed regen bias.
+%
+% Raising the limit therefore scales the torque CURVE only - it cannot
+% invent regen during a stop the driver took entirely on the pedal, so the
+% resulting energy stays bounded by the observed regen opportunity.
+scale = current_limit / RC.current_limit_actual;
+
+omega_from_speed        = max(derived.speed_mph * 0.44704 / RC.WheelR, 0.1);   % rad/s
+torque_from_power_limit = RC.regen_power_limit ./ omega_from_speed;            % Nm
+
+max_regen_torque = RC.regen_max_curve_a * derived.speed_mph.^(RC.regen_max_curve_b) ...
+    * scale * RC.regen_efficiency;
+max_regen_torque(derived.speed_mph < 1) = 0;
+
+effective_max_torque   = min(min(max_regen_torque, torque_from_power_limit), ...
+    RC.torque_limit_total_wheel);
+predicted_regen_torque = -effective_max_torque .* double(regen_idx);
+
+P = (predicted_regen_torque .* derived.Tbias_regen / 2)     .* derived.fl_omega_wheel + ...
+    (predicted_regen_torque .* derived.Tbias_regen / 2)     .* derived.fr_omega_wheel + ...
+    (predicted_regen_torque .* (1-derived.Tbias_regen) / 2) .* derived.rl_omega_wheel + ...
+    (predicted_regen_torque .* (1-derived.Tbias_regen) / 2) .* derived.rr_omega_wheel;
 end
 
 
