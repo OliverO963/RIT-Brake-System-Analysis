@@ -75,7 +75,7 @@ torque_limit_total_wheel = VP.torque_limit_total_MN / 100 * 9.8 * gear_ratio;  %
 % Current limits to compare in the theoretical-torque figure. This is a
 % sweep setting rather than a vehicle property, and loadVehicleParams is
 % scalar-only, so it stays here.
-current_limits = [30, 35, 40];   % A
+current_limits = [30, 35, 40, 45, 50, 55];   % A
 limit_colors   = {'r-', 'g-', 'b-'};
 
 % Finer grid for the regen-fraction-vs-current-limit figure, which needs a
