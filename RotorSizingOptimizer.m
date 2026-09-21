@@ -22,7 +22,7 @@ clc; clear; close all
 
 %% ================== USER INPUTS ==================
 cfg.paramFile   = 'RotorSizingParameters.xlsx';
-cfg.cycleFile   = 'MotorTorque.csv';
+cfg.cycleFile   = 'F35EnduranceSim.csv';
 cfg.resultsFile = 'RotorSizingResults.xlsx';
 cfg.makePlots   = true;
 cfg.verbose     = true;
@@ -484,7 +484,7 @@ if ~all(ismember({'Name','Value'}, T.Properties.VariableNames))
 end
 P = struct();
 for i = 1:height(T)
-    nm = strtrim(char(T.Name(i)));
+    try nm = strtrim(char(string(T.Name(i)))); catch, nm = ''; end
     if isempty(nm) || ~isvarname(nm), continue; end   % skips SECTION banner rows
     v = T.Value(i);
     if iscell(v), v = v{1}; end
