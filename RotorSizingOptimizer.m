@@ -1,8 +1,12 @@
 %% ================================================================
 %  Rotor Sizing Optimizer - target mass & convective area per rotor
 % ================================================================
-%  Consumes:  MotorTorque.csv            (simulated drive cycle)
-%             RotorSizingParameters.xlsx (all constants, read BY NAME)
+%  Consumes:  a drive-cycle CSV (either force-based, e.g.
+%             Regenerative_Braking_Forces_8_Laps.csv, or the legacy
+%             torque-based MotorTorque.csv format - auto-detected)
+%             VehicleParameters.xlsx  (the single shared parameter
+%             sheet also read by loadVehicleParams.m; all rotor-sizing
+%             constants live on its Parameters tab, read BY NAME)
 %
 %  Produces:  m_target and A_target for the FRONT and REAR rotor,
 %             an existence-proof geometry, a mass/area trade-off
@@ -15,222 +19,52 @@
 %  reused unchanged (see run_sim_rotor below). The lsqnonlin fit is
 %  NOT re-run: the fitted h_w and PadFrac coefficients are INPUTS.
 %
+%  FORCE-BASED FORMAT CORRECTION: FrictionBrakeForce_N,
+%  RequiredBrakingMagnitude_N, AvailableRegenMagnitude_N and
+%  AppliedRegenForce_N are longitudinal forces at the contact patch
+%  (not pedal input, not torque). A braking event is active whenever
+%  RequiredBrakingMagnitude_N > 0. FrictionBrakeForce_N is used
+%  directly as the friction-heat source (see ingest_new_format).
+%
 %  Requires: base MATLAB only (no toolboxes).
 % ================================================================
 
 clc; clear; close all
 
 %% ================== USER INPUTS ==================
-cfg.paramFile   = 'RotorSizingParameters.xlsx';
-cfg.cycleFile   = 'F35EnduranceSim.csv';
+cfg.paramFile   = 'VehicleParameters.xlsx';
+cfg.cycleFile   = 'Regenerative_Braking_Forces_8_Laps.csv';
 cfg.resultsFile = 'RotorSizingResults.xlsx';
 cfg.makePlots   = true;
 cfg.verbose     = true;
 
 P = load_rotor_params(cfg.paramFile);
+sides = {'front','rear'};
 
 %% ================== LOAD AND VALIDATE THE DRIVE CYCLE ==================
 C = readtable(cfg.cycleFile);
-needCols = {'time','dt_s','speed_mps','motor_rpm','drive_torque_per_motor_Nm', ...
-            'regen_torque_per_motor_Nm','torque_per_motor_Nm', ...
-            'total_motor_torque_Nm','friction_brake_force_N'};
-missing = needCols(~ismember(needCols, C.Properties.VariableNames));
-if ~isempty(missing)
-    error('RotorSizing:BadCycle','%s is missing column(s): %s', ...
-        cfg.cycleFile, strjoin(missing,', '));
+cols = C.Properties.VariableNames;
+isNewFormat = all(ismember({'Lap','Time_s','Speed_mps','RequiredBrakingMagnitude_N', ...
+    'AvailableRegenMagnitude_N','AppliedRegenForce_N','FrictionBrakeForce_N', ...
+    'AeroDragMagnitude_N','LongitudinalForce_N'}, cols));
+isOldFormat = all(ismember({'time','dt_s','speed_mps','motor_rpm', ...
+    'drive_torque_per_motor_Nm','regen_torque_per_motor_Nm', ...
+    'torque_per_motor_Nm','total_motor_torque_Nm','friction_brake_force_N'}, cols));
+if ~isNewFormat && ~isOldFormat
+    error('RotorSizing:BadCycle', ...
+        '%s matches neither the force-based format nor the legacy torque-based format.', ...
+        cfg.cycleFile);
 end
-n = height(C);
 
-V = struct();
-V.rows        = n;
-V.nan_count   = sum(sum(ismissing(C)));
-V.t_raw       = C.time;
-V.dt_s        = C.dt_s;
-V.span_raw    = C.time(end) - C.time(1);
-V.x4_maxerr   = max(abs(C.total_motor_torque_Nm - 4*C.torque_per_motor_Nm));
-V.sum_maxerr  = max(abs(C.torque_per_motor_Nm - ...
-                   (C.drive_torque_per_motor_Nm + C.regen_torque_per_motor_Nm)));
-
-% ---- Time base ---------------------------------------------------------
-% The `time` column in this file is written with only 3 significant figures
-% once t >= 1000 s ("1.00E+03"), so diff(time) collapses to 0 over the last
-% ~9,980 rows and spikes to 10 s at the few places it does tick. run_sim_opt
-% treats tbrake <= 0 by holding the temperature, so using diff(time) would
-% silently discard the last 23% of the run. The dt_s column is the leading
-% step (dt_s(i) = time(i+1) - time(i)) and agrees with diff(time) to 1e-4 s
-% everywhere the time column is not saturated, so it is used instead.
-dt_diff = [NaN; diff(C.time)];
-dt_lead = C.dt_s;
-okRegion = [false; C.time(2:end) < 1000];
-V.dt_s_vs_diff_maxerr = max(abs(dt_lead(1:end-1) - dt_diff(2:end)) .* okRegion(2:end));
-V.n_nonpositive_difftime = sum(dt_diff(2:end) <= 0);
-V.n_difftime_gt_100ms    = sum(dt_diff(2:end) > 0.1);
-
-if P.use_dt_s_column
-    tstep = [NaN; C.dt_s(1:end-1)];          % TRAILING step for row i
-    t     = [0; cumsum(C.dt_s(1:end-1))];    % reconstructed monotone clock
+if isNewFormat
+    [CYC, D, V, n] = ingest_new_format(C, P);
 else
-    tstep = dt_diff;
-    t     = C.time;
+    [CYC, D, V, n] = ingest_old_format(C, P);
 end
-V.span_used = t(end) - t(1);
-
-% ---- Speed cleaning, exactly as compute_derived_quantities() does ------
-velx = C.speed_mps;
-velx(abs(velx) > P.velx_threshold) = 0;
-velx(isnan(velx)) = 0;
-velx(velx < 0)    = 0;
-V.n_speed_cleaned = sum(velx ~= C.speed_mps);
-
-% ---- Lap detection -----------------------------------------------------
-% Each lap starts with two artifact rows (speed jumps down then back up).
-% The DOWN jump is exactly the original's DS < -2.5 condition.
-DS = [0; diff(velx)];
-lapIdx = find(DS < -2.5);
-V.lap_boundary_idx = lapIdx(:)';
-V.lap_count        = numel(lapIdx) + 1;
-V.lap_period_s     = median(diff(t(lapIdx)));
-artifact = false(n,1);
-artifact([1 2]) = true;                        % first lap's own two rows
-for k = 1:numel(lapIdx)
-    artifact(lapIdx(k)) = true;
-    if lapIdx(k)+1 <= n, artifact(lapIdx(k)+1) = true; end
-end
-if ~P.exclude_lap_artifacts, artifact(:) = false; end
-lapStart = false(n,1); lapStart(1) = true; lapStart(lapIdx) = true;
-
-% ---- Wheel-radius consistency check (diagnostic only) ------------------
-omega_wheel = C.motor_rpm / P.gear_ratio * 2*pi/60;
-r_implied   = velx ./ max(omega_wheel, eps);
-V.r_implied_mean = mean(r_implied);
-V.r_implied_vs_WheelR_pct = 100*(V.r_implied_mean/P.WheelR - 1);
-
-%% ================== PER-STEP ENERGY CHAIN (rotor-independent) ==========
-% Nothing here depends on RotorMass or RotorArea, so it is computed once.
-omega_all  = repmat(omega_wheel, 1, 4);          % [fl fr rl rr], identical
-omega_motor = C.motor_rpm * 2*pi/60;
-
-speed_mph = velx * 2.23694;
-if P.drs_state == 1
-    F_aero = P.aero_open_a*speed_mph.^2 + P.aero_open_b*speed_mph + P.aero_open_c;
-else
-    F_aero = P.aero_closed_a*speed_mph.^2 + P.aero_closed_b*speed_mph + P.aero_closed_c;
-end
-F_aero = max(F_aero, 0);
-
-dstep = zeros(n,1);
-dstep(2:end) = (velx(1:end-1) + velx(2:end))/2 .* tstep(2:end);
-Edrag = zeros(n,1);
-Edrag(2:end) = F_aero(2:end) .* dstep(2:end);
-
-% Vehicle + per-corner rotational KE loss
-E1 = zeros(n,1);  E1(2:end) = 0.5*P.VehicleMass*(velx(1:end-1).^2 - velx(2:end).^2);
-E2 = zeros(n,1);
-for c = 1:4
-    E2(2:end) = E2(2:end) + 0.5*P.I_corner*(omega_all(1:end-1,c).^2 - omega_all(2:end,c).^2);
-end
-Energy   = E1 + E2;
-AeroFrac = min(Edrag ./ max(Energy,1), 1);
-
-% Regen: per-motor power, gated on deceleration (derived from the speed
-% change, since the CSV has no accelx channel).
-decel = DS < 0;
-P_motor_regen = min(C.regen_torque_per_motor_Nm .* omega_motor, 0) .* double(decel);
-P_veh_regen   = 4 * P_motor_regen;
-ff = min(max(P.regen_front_frac_a + P.regen_front_frac_b*velx, 0), 1);
-axleRegen.front = ff .* P_veh_regen;
-axleRegen.rear  = (1-ff) .* P_veh_regen;
-
-% Braking-applied flag: PEDAL FORCE ONLY. This is the sole use of
-% friction_brake_force_N anywhere in this script - it never enters an
-% energy term.
-DSskip = DS; DSskip(DSskip < -2.5) = 0;
-brakeApplied = false(n,1);
-brakeApplied(2:end) = (DSskip(2:end) < 0) & ...
-                      (C.friction_brake_force_N(2:end) > P.min_pedal_force_N);
-brakeApplied = brakeApplied & ~artifact;
-
-Tbias.front = repmat(P.Tbias_front,     n, 1);
-Tbias.rear  = repmat(1 - P.Tbias_front, n, 1);
-
-sides = {'front','rear'};
-for s = 1:2
-    sd = sides{s};
-    Ecorner = Energy .* Tbias.(sd) * 0.5 .* (1 - AeroFrac);
-    Eregen  = abs(axleRegen.(sd)) .* [0; tstep(2:end)] * 0.5;
-    CYC.(sd).Ecorner = Ecorner;
-    CYC.(sd).Eregen  = Eregen;
-    CYC.(sd).Efric   = max(Ecorner - Eregen, 0);
-    CYC.(sd).clamped = brakeApplied & (Ecorner - Eregen <= 0);
-end
-CYC.tstep   = [0; tstep(2:end)];
-CYC.velx    = velx;
-CYC.active  = brakeApplied;
-CYC.t       = t;
-CYC.lapStart= lapStart;
-CYC.Energy  = Energy;
-CYC.Edrag   = Edrag;
-
-%% ================== DIAGNOSTICS ==================
-act = CYC.active;
-D.active_steps    = sum(act);
-D.KEloss_active_kJ = sum(Energy(act))/1e3;
-D.KEloss_alldecel_kJ = sum(Energy(DS<0))/1e3;
-D.Edrag_active_kJ = sum(Edrag(act))/1e3;
-D.regen_total_kJ  = sum(abs(P_veh_regen).*CYC.tstep)/1e3;
-for s = 1:2
-    sd = sides{s};
-    D.(['Efric_' sd '_kJ'])   = sum(CYC.(sd).Efric(act))/1e3;
-    D.(['Eregen_' sd '_kJ'])  = sum(CYC.(sd).Eregen(act))/1e3;
-    D.(['clamp_' sd '_pct'])  = 100*sum(CYC.(sd).clamped)/max(sum(act),1);
-end
-D.friction_share_of_KE_pct = 100*(D.Efric_front_kJ + D.Efric_rear_kJ)*2 / max(D.KEloss_active_kJ,1);
-D.aero_share_of_KE_pct     = 100*D.Edrag_active_kJ / max(D.KEloss_active_kJ,1);
-
-lapEdges = [find(lapStart); n+1];
-D.perLap_Efric_front_kJ = zeros(numel(lapEdges)-1,1);
-D.perLap_Efric_rear_kJ  = zeros(numel(lapEdges)-1,1);
-for k = 1:numel(lapEdges)-1
-    rows = lapEdges(k):lapEdges(k+1)-1;
-    D.perLap_Efric_front_kJ(k) = sum(CYC.front.Efric(rows) .* act(rows))/1e3;
-    D.perLap_Efric_rear_kJ(k)  = sum(CYC.rear.Efric(rows)  .* act(rows))/1e3;
-end
+lapEdges = [find(CYC.lapStart); n+1];
 
 if cfg.verbose
-    fprintf('\n================ DRIVE-CYCLE VALIDATION ================\n');
-    fprintf('rows                       : %d\n', V.rows);
-    fprintf('missing values             : %d\n', V.nan_count);
-    fprintf('time column span           : %.1f s (as written)\n', V.span_raw);
-    fprintf('time base used             : %.3f s (from %s)\n', V.span_used, ...
-        ternary(P.use_dt_s_column,'dt_s','diff(time)'));
-    fprintf('diff(time) <= 0 rows       : %d   (>100 ms rows: %d)\n', ...
-        V.n_nonpositive_difftime, V.n_difftime_gt_100ms);
-    fprintf('dt_s vs diff(time), t<1000 : max |err| = %.2e s\n', V.dt_s_vs_diff_maxerr);
-    fprintf('total = 4 x per-motor      : max |err| = %.2e Nm\n', V.x4_maxerr);
-    fprintf('laps detected              : %d   period %.4f s\n', V.lap_count, V.lap_period_s);
-    fprintf('lap boundary rows          : %s ...\n', mat2str(V.lap_boundary_idx(1:min(5,end))));
-    fprintf('implied wheel radius       : %.4f m vs WheelR %.4f m (%+.1f%%)\n', ...
-        V.r_implied_mean, P.WheelR, V.r_implied_vs_WheelR_pct);
-    fprintf('\n================ ENERGY DIAGNOSTICS ================\n');
-    fprintf('braking-active steps       : %d of %d\n', D.active_steps, n);
-    fprintf('KE loss on active steps    : %.1f kJ\n', D.KEloss_active_kJ);
-    fprintf('  aero share               : %.1f %%\n', D.aero_share_of_KE_pct);
-    fprintf('  friction share (4 rotors): %.1f %%\n', D.friction_share_of_KE_pct);
-    fprintf('vehicle regen energy       : %.1f kJ\n', D.regen_total_kJ);
-    for s = 1:2
-        sd = sides{s};
-        fprintf('%-5s rotor: friction %.1f kJ | regen %.1f kJ | per lap %.2f kJ | max(...,0) clamp on %.1f%% of braking steps\n', ...
-            sd, D.(['Efric_' sd '_kJ']), D.(['Eregen_' sd '_kJ']), ...
-            mean(D.(['perLap_Efric_' sd '_kJ'])), D.(['clamp_' sd '_pct']));
-        if D.(['clamp_' sd '_pct']) > 5
-            warning('RotorSizing:ClampActive', ...
-                ['*** %s: the max(Energy_corner - regen, 0) clamp is active on %.1f%% of braking ' ...
-                 'steps. Regen is being credited more energy than that corner has available, which ' ...
-                 'means the regen front/rear split (regen_front_frac_*) and/or Tbias_front are ' ...
-                 'inconsistent with the data. The %s heat figure is a LOWER BOUND until those are fixed.'], ...
-                 upper(sd), D.(['clamp_' sd '_pct']), sd);
-        end
-    end
+    print_diagnostics(V, D, P, cfg, sides, isNewFormat);
 end
 
 %% ================== ROTOR GEOMETRY DEFINITIONS ==================
@@ -243,7 +77,7 @@ G.rear  = make_geom(P.Do_rear_mm/1000,  P.Di_rear_mm/1000,  P.t_min_rear_mm/1000
 
 hw.front = [P.hw_x1_front, P.hw_b1_front];
 hw.rear  = [P.hw_x1_rear,  P.hw_b1_rear];
-TambK = P.TambC + 273.15;
+TambK = P.TambC_fallback + 273.15;
 TinitK = (P.T_init_F - 32)*(5/9) + 273.15;
 padp  = [P.padfrac_x2, P.padfrac_b2];
 
@@ -473,35 +307,401 @@ end
 %  LOCAL FUNCTIONS
 % ================================================================
 
+
+function [CYC, D, V, n] = ingest_new_format(C, P)
+%INGEST_NEW_FORMAT Force-based drive-cycle format (Lap, Time_s, AccelX_g,
+% MotorRPM, Speed_mps, LongitudinalForce_N, AeroDragMagnitude_N,
+% RequiredBrakingMagnitude_N, AvailableRegenMagnitude_N,
+% AppliedRegenForce_N, FrictionBrakeForce_N).
+%
+% CORRECTION APPLIED: FrictionBrakeForce_N, RequiredBrakingMagnitude_N,
+% AvailableRegenMagnitude_N and AppliedRegenForce_N are all longitudinal
+% forces at the CONTACT PATCH (whole vehicle), not pedal input and not
+% torques. A braking event is active whenever RequiredBrakingMagnitude_N
+% is nonzero (it is clipped at 0, so "nonzero" means "> 0").
+%
+% Because FrictionBrakeForce_N is the ACTUAL friction force already net of
+% regen (verified: FrictionBrakeForce_N + AppliedRegenForce_N =
+% -RequiredBrakingMagnitude_N to within 1e-6 N on the supplied file), the
+% friction heat at each corner is now a DIRECT measurement -
+% |FrictionBrakeForce_N| * distance, split by Tbias_front and the 0.5 L/R
+% split - rather than an estimate backed out of a KE-loss/regen
+% subtraction. This removes the old max(Ecorner-regen,0) clamp entirely
+% (there is nothing left to clamp) and no longer needs the regen
+% front/rear split for the heat calculation itself.
+n = height(C);
+sides = {'front','rear'};
+
+V = struct();
+V.rows       = n;
+V.nan_count  = sum(sum(ismissing(C)));
+t     = C.Time_s;
+tstep = [0; diff(t)];
+V.span         = t(end) - t(1);
+V.dt_median    = median(tstep(2:end));
+V.dt_uniform   = all(abs(tstep(2:end) - V.dt_median) < 1e-9);
+
+velx = C.Speed_mps;
+velx(abs(velx) > P.velx_threshold) = 0;
+velx(isnan(velx)) = 0;
+velx(velx < 0)    = 0;
+V.n_speed_cleaned = sum(velx ~= C.Speed_mps);
+
+lapStart = [true; diff(C.Lap) ~= 0];
+V.lap_count = sum(lapStart);
+lapRows     = diff([find(lapStart); n+1]);
+V.lap_rows_equal = all(lapRows == lapRows(1));
+V.lap_rows_first = lapRows(1);
+
+% ---- Wheel-radius consistency check (diagnostic only) ------------------
+omega_wheel = C.MotorRPM / P.gear_ratio * 2*pi/60;
+r_implied   = velx ./ max(omega_wheel, eps);
+V.r_implied_mean = mean(r_implied);
+V.r_implied_vs_WheelR_pct = 100*(V.r_implied_mean/P.WheelR - 1);
+
+RB = C.RequiredBrakingMagnitude_N;
+FB = C.FrictionBrakeForce_N;
+AR = C.AppliedRegenForce_N;
+AV = C.AvailableRegenMagnitude_N;
+LF = C.LongitudinalForce_N;
+AD = C.AeroDragMagnitude_N;
+
+active = RB > 0;
+V.active_steps = sum(active);
+
+% ---- Identity checks on the corrected columns (cheap, high-value) ------
+V.identity_FB_AR_RB_maxerr = max(abs(FB + AR + RB));
+V.identity_LF_RB_AD_maxerr_braking = max(abs(LF(active) - (-RB(active) - AD(active))));
+V.n_active_with_AccelX_nonneg = sum(active & (C.AccelX_g >= 0));
+
+dstep = zeros(n,1);
+dstep(2:end) = (velx(1:end-1) + velx(2:end))/2 .* tstep(2:end);
+Efric_total = abs(FB) .* dstep;      % vehicle-total friction energy, this step
+
+Tbias.front = P.Tbias_front;
+Tbias.rear  = 1 - P.Tbias_front;
+for s = 1:2
+    sd = sides{s};
+    CYC.(sd).Efric = Efric_total * Tbias.(sd) * 0.5;   % front/rear x L/R split
+end
+CYC.tstep    = tstep;
+CYC.velx     = velx;
+CYC.active   = active;
+CYC.t        = t;
+CYC.lapStart = lapStart;
+
+% ---- Diagnostics ----
+D.rows = n; D.active_steps = V.active_steps; D.laps = V.lap_count;
+D.regen_applied_total_kJ   = sum(abs(AR).*dstep)/1e3;
+D.regen_available_total_kJ = sum(AV.*dstep)/1e3;
+D.required_braking_total_kJ = sum(RB.*dstep)/1e3;
+for s = 1:2
+    sd = sides{s};
+    D.(['Efric_' sd '_kJ']) = sum(CYC.(sd).Efric(active))/1e3;
+end
+D.friction_share_of_required_pct = 100*sum(Efric_total(active)) / max(D.required_braking_total_kJ*1e3,1);
+D.identity_FB_AR_RB_maxerr = V.identity_FB_AR_RB_maxerr;
+
+lapEdgesLocal = [find(lapStart); n+1];
+D.perLap_Efric_front_kJ = zeros(numel(lapEdgesLocal)-1,1);
+D.perLap_Efric_rear_kJ  = zeros(numel(lapEdgesLocal)-1,1);
+for k = 1:numel(lapEdgesLocal)-1
+    rows = lapEdgesLocal(k):lapEdgesLocal(k+1)-1;
+    D.perLap_Efric_front_kJ(k) = sum(CYC.front.Efric(rows) .* active(rows))/1e3;
+    D.perLap_Efric_rear_kJ(k)  = sum(CYC.rear.Efric(rows)  .* active(rows))/1e3;
+end
+end
+
+
+function [CYC, D, V, n] = ingest_old_format(C, P)
+%INGEST_OLD_FORMAT Legacy torque-based drive-cycle format (MotorTorque.csv-
+% style: time, dt_s, speed_mps, motor_rpm, drive/regen/total torque per
+% motor, friction_brake_force_N as PEDAL FORCE only). Friction heat is
+% estimated by subtracting a per-corner regen split from the KE-loss chain,
+% clamped at zero. Kept for backward compatibility with older drive cycles;
+% new work should use the force-based format (see ingest_new_format).
+n = height(C);
+
+V = struct();
+V.rows        = n;
+V.nan_count   = sum(sum(ismissing(C)));
+V.t_raw       = C.time;
+V.dt_s        = C.dt_s;
+V.span_raw    = C.time(end) - C.time(1);
+V.x4_maxerr   = max(abs(C.total_motor_torque_Nm - 4*C.torque_per_motor_Nm));
+V.sum_maxerr  = max(abs(C.torque_per_motor_Nm - ...
+                   (C.drive_torque_per_motor_Nm + C.regen_torque_per_motor_Nm)));
+
+% ---- Time base ---------------------------------------------------------
+% The `time` column in this file is written with only 3 significant figures
+% once t >= 1000 s ("1.00E+03"), so diff(time) collapses to 0 over the last
+% ~9,980 rows and spikes to 10 s at the few places it does tick. run_sim_opt
+% treats tbrake <= 0 by holding the temperature, so using diff(time) would
+% silently discard the last 23% of the run. The dt_s column is the leading
+% step (dt_s(i) = time(i+1) - time(i)) and agrees with diff(time) to 1e-4 s
+% everywhere the time column is not saturated, so it is used instead.
+dt_diff = [NaN; diff(C.time)];
+dt_lead = C.dt_s;
+okRegion = [false; C.time(2:end) < 1000];
+V.dt_s_vs_diff_maxerr = max(abs(dt_lead(1:end-1) - dt_diff(2:end)) .* okRegion(2:end));
+V.n_nonpositive_difftime = sum(dt_diff(2:end) <= 0);
+V.n_difftime_gt_100ms    = sum(dt_diff(2:end) > 0.1);
+
+if P.use_dt_s_column
+    tstep = [NaN; C.dt_s(1:end-1)];          % TRAILING step for row i
+    t     = [0; cumsum(C.dt_s(1:end-1))];    % reconstructed monotone clock
+else
+    tstep = dt_diff;
+    t     = C.time;
+end
+V.span_used = t(end) - t(1);
+
+% ---- Speed cleaning, exactly as compute_derived_quantities() does ------
+velx = C.speed_mps;
+velx(abs(velx) > P.velx_threshold) = 0;
+velx(isnan(velx)) = 0;
+velx(velx < 0)    = 0;
+V.n_speed_cleaned = sum(velx ~= C.speed_mps);
+
+% ---- Lap detection -----------------------------------------------------
+% Each lap starts with two artifact rows (speed jumps down then back up).
+% The DOWN jump is exactly the original's DS < -2.5 condition.
+DS = [0; diff(velx)];
+lapIdx = find(DS < -2.5);
+V.lap_boundary_idx = lapIdx(:)';
+V.lap_count        = numel(lapIdx) + 1;
+V.lap_period_s     = median(diff(t(lapIdx)));
+artifact = false(n,1);
+artifact([1 2]) = true;                        % first lap's own two rows
+for k = 1:numel(lapIdx)
+    artifact(lapIdx(k)) = true;
+    if lapIdx(k)+1 <= n, artifact(lapIdx(k)+1) = true; end
+end
+if ~P.exclude_lap_artifacts, artifact(:) = false; end
+lapStart = false(n,1); lapStart(1) = true; lapStart(lapIdx) = true;
+
+% ---- Wheel-radius consistency check (diagnostic only) ------------------
+omega_wheel = C.motor_rpm / P.gear_ratio * 2*pi/60;
+r_implied   = velx ./ max(omega_wheel, eps);
+V.r_implied_mean = mean(r_implied);
+V.r_implied_vs_WheelR_pct = 100*(V.r_implied_mean/P.WheelR - 1);
+
+%% ================== PER-STEP ENERGY CHAIN (rotor-independent) ==========
+% Nothing here depends on RotorMass or RotorArea, so it is computed once.
+omega_all  = repmat(omega_wheel, 1, 4);          % [fl fr rl rr], identical
+omega_motor = C.motor_rpm * 2*pi/60;
+
+speed_mph = velx * 2.23694;
+if P.drs_state == 1
+    F_aero = P.aero_open_a*speed_mph.^2 + P.aero_open_b*speed_mph + P.aero_open_c;
+else
+    F_aero = P.aero_closed_a*speed_mph.^2 + P.aero_closed_b*speed_mph + P.aero_closed_c;
+end
+F_aero = max(F_aero, 0);
+
+dstep = zeros(n,1);
+dstep(2:end) = (velx(1:end-1) + velx(2:end))/2 .* tstep(2:end);
+Edrag = zeros(n,1);
+Edrag(2:end) = F_aero(2:end) .* dstep(2:end);
+
+% Vehicle + per-corner rotational KE loss
+E1 = zeros(n,1);  E1(2:end) = 0.5*P.VehicleMass*(velx(1:end-1).^2 - velx(2:end).^2);
+E2 = zeros(n,1);
+for c = 1:4
+    E2(2:end) = E2(2:end) + 0.5*P.I_corner*(omega_all(1:end-1,c).^2 - omega_all(2:end,c).^2);
+end
+Energy   = E1 + E2;
+AeroFrac = min(Edrag ./ max(Energy,1), 1);
+
+% Regen: per-motor power, gated on deceleration (derived from the speed
+% change, since the CSV has no accelx channel).
+decel = DS < 0;
+P_motor_regen = min(C.regen_torque_per_motor_Nm .* omega_motor, 0) .* double(decel);
+P_veh_regen   = 4 * P_motor_regen;
+ff = min(max(P.regen_front_frac_a + P.regen_front_frac_b*velx, 0), 1);
+axleRegen.front = ff .* P_veh_regen;
+axleRegen.rear  = (1-ff) .* P_veh_regen;
+
+% Braking-applied flag: PEDAL FORCE ONLY. This is the sole use of
+% friction_brake_force_N anywhere in this script - it never enters an
+% energy term.
+DSskip = DS; DSskip(DSskip < -2.5) = 0;
+brakeApplied = false(n,1);
+brakeApplied(2:end) = (DSskip(2:end) < 0) & ...
+                      (C.friction_brake_force_N(2:end) > P.min_pedal_force_N);
+brakeApplied = brakeApplied & ~artifact;
+
+Tbias.front = repmat(P.Tbias_front,     n, 1);
+Tbias.rear  = repmat(1 - P.Tbias_front, n, 1);
+
+sides = {'front','rear'};
+for s = 1:2
+    sd = sides{s};
+    Ecorner = Energy .* Tbias.(sd) * 0.5 .* (1 - AeroFrac);
+    Eregen  = abs(axleRegen.(sd)) .* [0; tstep(2:end)] * 0.5;
+    CYC.(sd).Ecorner = Ecorner;
+    CYC.(sd).Eregen  = Eregen;
+    CYC.(sd).Efric   = max(Ecorner - Eregen, 0);
+    CYC.(sd).clamped = brakeApplied & (Ecorner - Eregen <= 0);
+end
+CYC.tstep   = [0; tstep(2:end)];
+CYC.velx    = velx;
+CYC.active  = brakeApplied;
+CYC.t       = t;
+CYC.lapStart= lapStart;
+CYC.Energy  = Energy;
+CYC.Edrag   = Edrag;
+
+%% ================== DIAGNOSTICS ==================
+act = CYC.active;
+D.active_steps    = sum(act);
+D.KEloss_active_kJ = sum(Energy(act))/1e3;
+D.KEloss_alldecel_kJ = sum(Energy(DS<0))/1e3;
+D.Edrag_active_kJ = sum(Edrag(act))/1e3;
+D.regen_total_kJ  = sum(abs(P_veh_regen).*CYC.tstep)/1e3;
+for s = 1:2
+    sd = sides{s};
+    D.(['Efric_' sd '_kJ'])   = sum(CYC.(sd).Efric(act))/1e3;
+    D.(['Eregen_' sd '_kJ'])  = sum(CYC.(sd).Eregen(act))/1e3;
+    D.(['clamp_' sd '_pct'])  = 100*sum(CYC.(sd).clamped)/max(sum(act),1);
+end
+D.friction_share_of_KE_pct = 100*(D.Efric_front_kJ + D.Efric_rear_kJ)*2 / max(D.KEloss_active_kJ,1);
+D.aero_share_of_KE_pct     = 100*D.Edrag_active_kJ / max(D.KEloss_active_kJ,1);
+
+lapEdges = [find(lapStart); n+1];
+D.perLap_Efric_front_kJ = zeros(numel(lapEdges)-1,1);
+D.perLap_Efric_rear_kJ  = zeros(numel(lapEdges)-1,1);
+for k = 1:numel(lapEdges)-1
+    rows = lapEdges(k):lapEdges(k+1)-1;
+    D.perLap_Efric_front_kJ(k) = sum(CYC.front.Efric(rows) .* act(rows))/1e3;
+    D.perLap_Efric_rear_kJ(k)  = sum(CYC.rear.Efric(rows)  .* act(rows))/1e3;
+end
+end
+
+
+function print_diagnostics(V, D, P, cfg, sides, isNewFormat) %#ok<INUSL>
+if isNewFormat
+    fprintf('\n================ DRIVE-CYCLE VALIDATION (%s) ================\n', cfg.cycleFile);
+    fprintf('rows                       : %d\n', V.rows);
+    fprintf('missing values             : %d\n', V.nan_count);
+    fprintf('time span                  : %.2f s   dt = %.4f s (uniform: %s)\n', ...
+        V.span, V.dt_median, ternary(V.dt_uniform,'yes','no'));
+    fprintf('speed values cleaned       : %d\n', V.n_speed_cleaned);
+    fprintf('laps (Lap column)          : %d   (%d rows/lap, equal: %s)\n', ...
+        V.lap_count, V.lap_rows_first, ternary(V.lap_rows_equal,'yes','no'));
+    fprintf('implied wheel radius       : %.4f m vs WheelR %.4f m (%+.1f%%)\n', ...
+        V.r_implied_mean, P.WheelR, V.r_implied_vs_WheelR_pct);
+    fprintf('braking-active steps       : %d of %d  (RequiredBrakingMagnitude_N > 0)\n', ...
+        V.active_steps, V.rows);
+    fprintf('identity FB+AR+RB ~= 0     : max |err| = %.2e N\n', V.identity_FB_AR_RB_maxerr);
+    fprintf('identity LF ~= -RB-AD (braking rows): max |err| = %.2e N\n', ...
+        V.identity_LF_RB_AD_maxerr_braking);
+    if V.n_active_with_AccelX_nonneg > 0
+        warning('RotorSizing:UnexpectedAccel', ...
+            '%d braking-active rows have AccelX_g >= 0 (expected negative during braking).', ...
+            V.n_active_with_AccelX_nonneg);
+    end
+    fprintf('\n================ ENERGY DIAGNOSTICS ================\n');
+    fprintf('required braking energy    : %.2f kJ\n', D.required_braking_total_kJ);
+    fprintf('regen applied              : %.2f kJ   (available: %.2f kJ)\n', ...
+        D.regen_applied_total_kJ, D.regen_available_total_kJ);
+    fprintf('friction share of required : %.1f %%\n', D.friction_share_of_required_pct);
+    for s = 1:2
+        sd = sides{s};
+        fprintf('%-5s rotor: friction %.2f kJ (direct measurement, no clamp)\n', ...
+            sd, D.(['Efric_' sd '_kJ']));
+    end
+else
+    fprintf('\n================ DRIVE-CYCLE VALIDATION (%s) ================\n', cfg.cycleFile);
+    fprintf('rows                       : %d\n', V.rows);
+    fprintf('missing values             : %d\n', V.nan_count);
+    fprintf('time column span           : %.1f s (as written)\n', V.span_raw);
+    fprintf('time base used             : %.3f s (from %s)\n', V.span_used, ...
+        ternary(P.use_dt_s_column,'dt_s','diff(time)'));
+    fprintf('diff(time) <= 0 rows       : %d   (>100 ms rows: %d)\n', ...
+        V.n_nonpositive_difftime, V.n_difftime_gt_100ms);
+    fprintf('dt_s vs diff(time), t<1000 : max |err| = %.2e s\n', V.dt_s_vs_diff_maxerr);
+    fprintf('total = 4 x per-motor      : max |err| = %.2e Nm\n', V.x4_maxerr);
+    fprintf('laps detected              : %d   period %.4f s\n', V.lap_count, V.lap_period_s);
+    fprintf('lap boundary rows          : %s ...\n', mat2str(V.lap_boundary_idx(1:min(5,end))));
+    fprintf('implied wheel radius       : %.4f m vs WheelR %.4f m (%+.1f%%)\n', ...
+        V.r_implied_mean, P.WheelR, V.r_implied_vs_WheelR_pct);
+    fprintf('\n================ ENERGY DIAGNOSTICS ================\n');
+    fprintf('braking-active steps       : %d of %d\n', D.active_steps, V.rows);
+    fprintf('KE loss on active steps    : %.1f kJ\n', D.KEloss_active_kJ);
+    fprintf('  aero share               : %.1f %%\n', D.aero_share_of_KE_pct);
+    fprintf('  friction share (4 rotors): %.1f %%\n', D.friction_share_of_KE_pct);
+    fprintf('vehicle regen energy       : %.1f kJ\n', D.regen_total_kJ);
+    for s = 1:2
+        sd = sides{s};
+        fprintf('%-5s rotor: friction %.1f kJ | regen %.1f kJ | per lap %.2f kJ | max(...,0) clamp on %.1f%% of braking steps\n', ...
+            sd, D.(['Efric_' sd '_kJ']), D.(['Eregen_' sd '_kJ']), ...
+            mean(D.(['perLap_Efric_' sd '_kJ'])), D.(['clamp_' sd '_pct']));
+        if D.(['clamp_' sd '_pct']) > 5
+            warning('RotorSizing:ClampActive', ...
+                ['*** %s: the max(Energy_corner - regen, 0) clamp is active on %.1f%% of braking ' ...
+                 'steps. Regen is being credited more energy than that corner has available, which ' ...
+                 'means the regen front/rear split (regen_front_frac_*) and/or Tbias_front are ' ...
+                 'inconsistent with the data. The %s heat figure is a LOWER BOUND until those are fixed.'], ...
+                 upper(sd), D.(['clamp_' sd '_pct']), sd);
+        end
+    end
+end
+end
+
+
 function P = load_rotor_params(xlsxPath)
-%LOAD_ROTOR_PARAMS Read the Parameters sheet BY NAME into a struct.
+%LOAD_ROTOR_PARAMS Read the shared "Parameters" sheet BY NAME into a struct.
+% Mirrors loadVehicleParams.m's own import loop exactly (same read call, same
+% per-row conversion, same isvarname error-on-bad-name behavior, same
+% fail-loudly missing-field check) so the two loaders behave identically
+% against the one spreadsheet both scripts now read.
 if ~isfile(xlsxPath)
     error('RotorSizing:NoParams','Parameter file not found: %s', xlsxPath);
 end
 T = readtable(xlsxPath, 'Sheet', 'Parameters', 'TextType', 'string');
-if ~all(ismember({'Name','Value'}, T.Properties.VariableNames))
-    error('RotorSizing:BadSchema','Sheet "Parameters" needs Name and Value columns.');
+requiredCols = {'Name', 'Value'};
+missingCols = requiredCols(~ismember(requiredCols, T.Properties.VariableNames));
+if ~isempty(missingCols)
+    error('RotorSizing:BadSchema', ...
+        'Sheet "Parameters" is missing required column(s): %s', strjoin(missingCols, ', '));
 end
+
 P = struct();
 for i = 1:height(T)
-    try nm = strtrim(char(string(T.Name(i)))); catch, nm = ''; end
-    if isempty(nm) || ~isvarname(nm), continue; end   % skips SECTION banner rows
-    v = T.Value(i);
-    if iscell(v), v = v{1}; end
-    if ~isnumeric(v) || ~isscalar(v) || ~isfinite(v)
-        error('RotorSizing:BadValue','Parameter "%s" must be a finite numeric scalar.', nm);
+    rawName = T.Name(i);
+    if ismissing(rawName)          % blank Name cell -> skip, don't error on char()
+        continue
     end
-    if isfield(P, nm)
-        error('RotorSizing:Duplicate','Parameter "%s" appears more than once.', nm);
+    name = strtrim(char(rawName));
+    if isempty(name)
+        continue
     end
-    P.(nm) = v;
+    if ~isvarname(name)
+        error('RotorSizing:BadName', ...
+            'Row %d: "%s" is not a valid MATLAB field name.', i, name);
+    end
+    value = T.Value(i);
+    if iscell(value); value = value{1}; end
+    if ~isnumeric(value) || ~isscalar(value) || ~isfinite(value)
+        error('RotorSizing:BadValue', ...
+            'Parameter "%s" (row %d) must be a finite numeric scalar.', name, i);
+    end
+    if isfield(P, name)
+        error('RotorSizing:DuplicateName', ...
+            'Parameter "%s" is defined more than once.', name);
+    end
+    P.(name) = value;
 end
-need = {'VehicleMass','I_corner','WheelR','gear_ratio','rho_rotor','velx_threshold', ...
+
+% ---- Presence check: fail loudly on a renamed/deleted row rather than
+%      silently propagating an undefined field into the physics ----
+expected = {'VehicleMass','I_corner','WheelR','gear_ratio','rho_rotor','velx_threshold', ...
     'BrakeFrac','CalibrationFactor','aero_open_a','aero_open_b','aero_open_c', ...
     'aero_closed_a','aero_closed_b','aero_closed_c','drs_state', ...
     'hw_x1_front','hw_b1_front','hw_x1_rear','hw_b1_rear','padfrac_x2','padfrac_b2', ...
     'Tbias_front','regen_front_frac_a','regen_front_frac_b','min_pedal_force_N', ...
-    'T_target_F','TambC','T_init_F', ...
+    'T_target_F','TambC_fallback','T_init_F', ...
     'Do_front_mm','Di_front_mm','t_min_front_mm','t_max_front_mm','s_min_front_mm', ...
     'phi_max_front','cut_type_front', ...
     'Do_rear_mm','Di_rear_mm','t_min_rear_mm','t_max_rear_mm','s_min_rear_mm', ...
@@ -509,9 +709,10 @@ need = {'VehicleMass','I_corner','WheelR','gear_ratio','rho_rotor','velx_thresho
     'enforce_pattern_packing','use_dt_s_column', ...
     'exclude_lap_artifacts','n_mass_grid','A_bracket_lo','A_bracket_hi', ...
     'area_bisect_iters','euler_warn_threshold'};
-miss = need(~isfield(P, need));
-if ~isempty(miss)
-    error('RotorSizing:MissingParams','Missing parameter(s): %s', strjoin(miss,', '));
+missingParams = expected(~isfield(P, expected));
+if ~isempty(missingParams)
+    error('RotorSizing:MissingParams', ...
+        'Spreadsheet is missing required parameter(s): %s', strjoin(missingParams, ', '));
 end
 end
 
