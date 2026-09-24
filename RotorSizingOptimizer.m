@@ -26,6 +26,13 @@
 %  RequiredBrakingMagnitude_N > 0. FrictionBrakeForce_N is used
 %  directly as the friction-heat source (see ingest_new_format).
 %
+%  UNIT CORRECTION: the new format's Speed_mps column is mislabeled -
+%  it is actually MPH. Converted x0.44704 at ingestion (see
+%  ingest_new_format); confirmed via the wheel-radius consistency
+%  check. Getting this wrong silently drops over half the drive
+%  cycle from the friction-energy calculation, because the old
+%  m/s-calibrated velx_threshold then clips most rows to zero.
+%
 %  Requires: base MATLAB only (no toolboxes).
 % ================================================================
 
@@ -138,7 +145,7 @@ for s = 1:2
 
     % --- Explicit-Euler stability guard ---
     cpMin = (0.0005*TinitK + 0.2813)*1000;
-    hwMax = hw.(sd)(1)*max(velx) + hw.(sd)(2);
+    hwMax = hw.(sd)(1)*max(CYC.velx) + hw.(sd)(2);
     euler = max(CYC.tstep) * hwMax * max(Ag, proof.A) / (m_t * cpMin);
     if euler > P.euler_warn_threshold
         warning('RotorSizing:Euler', ...
@@ -341,11 +348,22 @@ V.span         = t(end) - t(1);
 V.dt_median    = median(tstep(2:end));
 V.dt_uniform   = all(abs(tstep(2:end) - V.dt_median) < 1e-9);
 
-velx = C.Speed_mps;
+% UNIT CORRECTION: the Speed_mps column is mislabeled - it is actually in
+% mph, not m/s. Confirmed independently by the wheel-radius check below:
+% treating the raw column as m/s implies a 0.454 m wheel radius (over
+% double WheelR = 0.213 m), while converting mph->m/s implies 0.203 m,
+% a -4.7% mismatch - the same order and sign as the legacy MotorTorque.csv
+% file's own wheel-radius check from the prior load case. Every downstream
+% quantity (h_w, distance, friction energy) depends on velx, so the
+% conversion is applied once here at the source.
+MPH_TO_MPS = 0.44704;
+velx_raw_mph = C.Speed_mps;
+velx = velx_raw_mph * MPH_TO_MPS;
 velx(abs(velx) > P.velx_threshold) = 0;
 velx(isnan(velx)) = 0;
 velx(velx < 0)    = 0;
-V.n_speed_cleaned = sum(velx ~= C.Speed_mps);
+V.n_speed_cleaned = sum(velx ~= velx_raw_mph*MPH_TO_MPS);
+V.speed_unit_corrected = true;
 
 lapStart = [true; diff(C.Lap) ~= 0];
 V.lap_count = sum(lapStart);
@@ -586,10 +604,11 @@ if isNewFormat
     fprintf('missing values             : %d\n', V.nan_count);
     fprintf('time span                  : %.2f s   dt = %.4f s (uniform: %s)\n', ...
         V.span, V.dt_median, ternary(V.dt_uniform,'yes','no'));
+    fprintf('speed unit correction      : Speed_mps column is mph, mislabeled; converted x0.44704\n');
     fprintf('speed values cleaned       : %d\n', V.n_speed_cleaned);
     fprintf('laps (Lap column)          : %d   (%d rows/lap, equal: %s)\n', ...
         V.lap_count, V.lap_rows_first, ternary(V.lap_rows_equal,'yes','no'));
-    fprintf('implied wheel radius       : %.4f m vs WheelR %.4f m (%+.1f%%)\n', ...
+    fprintf('implied wheel radius       : %.4f m vs WheelR %.4f m (%+.1f%%)  [post-conversion]\n', ...
         V.r_implied_mean, P.WheelR, V.r_implied_vs_WheelR_pct);
     fprintf('braking-active steps       : %d of %d  (RequiredBrakingMagnitude_N > 0)\n', ...
         V.active_steps, V.rows);
