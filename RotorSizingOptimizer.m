@@ -40,7 +40,7 @@ clc; clear; close all
 
 %% ================== USER INPUTS ==================
 cfg.paramFile   = 'VehicleParameters.xlsx';
-cfg.cycleFile   = 'Regenerative_Braking_Forces_8_Laps.csv';
+cfg.cycleFile   = 'F35_8HardLapsSim.csv';
 cfg.resultsFile = 'RotorSizingResults.xlsx';
 cfg.makePlots   = true;
 cfg.verbose     = true;
